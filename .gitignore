@@ -1,0 +1,50 @@
+# Original/private design material
+../NetBridge_Software_Design_Specification.docx
+NetBridge_Software_Design_Specification.docx
+docs/HANDOFF.md
+docs/phase1-validation.md
+docs/phase2-validation.md
+docs/app-validation.md
+docs/memory-validation.md
+
+# Device identity, credentials, and runtime state
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.json
+!config/*.json.example
+!tests/fixtures/*.json
+**/admin.json
+**/pairing.json
+**/phase1.json
+**/app-migration-baseline.json
+.ssh_known_hosts
+
+# Local/build/runtime artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.o
+*.a
+scripts/netbridge-lease
+portal-public/
+ca/
+portal-tls/
+dist/
+build/
+*.log
+docs/app-screen.png
+
+# Secrets and local environment files
+.env
+.env.*
+*.secret
+*.password
+*.token
+*.sqlite*
+
+# Generated design source stays local; the selected icon is intentionally tracked.
+assets/*-master.png

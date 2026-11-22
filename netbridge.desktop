@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=NetBridge
+Exec=/usr/local/lib/netbridge/netbridge-app.py
+Icon=share/images/netbridge-icon.png
+Terminal=false
+Type=Application

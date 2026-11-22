@@ -1,0 +1,38 @@
+[Unit]
+Description=NetBridge local onboarding and HTTPS administration
+After=netbridge-ap.service netbridge-controller.service
+Wants=netbridge-ap.service netbridge-controller.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=netbridge-portal
+Group=netbridge-portal
+ExecStart=/usr/bin/python3 /usr/local/lib/netbridge/portal/server.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+InaccessiblePaths=/var/lib/netbridge/ca
+MemoryHigh=48M
+MemoryMax=64M
+TasksMax=16
+LimitNOFILE=128
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=MALLOC_ARENA_MAX=1
+Environment=MALLOC_TRIM_THRESHOLD_=32768
+
+[Install]
+WantedBy=multi-user.target

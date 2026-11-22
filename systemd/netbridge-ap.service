@@ -1,0 +1,17 @@
+[Unit]
+Description=NetBridge Phase 1 protected Wi-Fi gateway
+Wants=network-online.target
+After=NetworkManager.service network-online.target nftables.service
+Requires=NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /usr/local/lib/netbridge/netbridge-network.py start
+ExecStop=/usr/bin/python3 /usr/local/lib/netbridge/netbridge-network.py stop
+TimeoutStartSec=100
+TimeoutStopSec=60
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

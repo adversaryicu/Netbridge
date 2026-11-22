@@ -1,0 +1,7 @@
+[Unit]
+Description=Renew the NetBridge portal leaf certificate when needed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/netbridge/netbridge-portal.py renew
+UMask=0077

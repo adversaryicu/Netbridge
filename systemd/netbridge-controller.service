@@ -1,0 +1,29 @@
+[Unit]
+Description=NetBridge local privileged controller
+After=NetworkManager.service netbridge-ap.service
+Wants=netbridge-ap.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/netbridge/portal/controller.py
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=netbridge
+RuntimeDirectoryMode=0755
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/netbridge /etc/netbridge /etc/NetworkManager/system-connections /run/netbridge
+MemoryHigh=64M
+MemoryMax=96M
+TasksMax=32
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=MALLOC_ARENA_MAX=1
+Environment=MALLOC_TRIM_THRESHOLD_=32768
+
+[Install]
+WantedBy=multi-user.target
