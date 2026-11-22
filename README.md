@@ -112,5 +112,6 @@ See [NEXT-STEPS.md](docs/NEXT-STEPS.md) for acceptance gates and known gaps.
 
 ## License
 
-No license has been selected for this repository yet. Until one is added, all
-rights remain with the project owner.
+NetBridge is available under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+You may use, study, modify, and share it for noncommercial purposes. Commercial
+use is not granted by this license. The complete terms are in `LICENSE`.
