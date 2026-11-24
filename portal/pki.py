@@ -109,7 +109,7 @@ def provision(root, gateway, rotate=False):
     return metadata(cert)
 
 
-def publish(root, public, tls, gateway, portal_gid):
+def publish(root, public, tls, gateway, portal_gid, proxy_dir=None, proxy_gid=None):
     current = Path(root) / 'current'
     _, ca = validate_ca(current)
     leaf_path = current / 'portal-cert.pem'
@@ -129,14 +129,23 @@ def publish(root, public, tls, gateway, portal_gid):
         destination = tls / filename
         write(destination, (current / filename).read_bytes(), 0o640)
         os.chown(destination, 0, portal_gid)
+    if proxy_dir is not None and proxy_gid is not None:
+        proxy_dir = Path(proxy_dir)
+        proxy_dir.mkdir(parents=True, exist_ok=True, mode=0o750)
+        os.chmod(proxy_dir, 0o750)
+        os.chown(proxy_dir, 0, proxy_gid)
+        for filename in ('mitmproxy-ca.pem', 'mitmproxy-ca-cert.pem'):
+            destination = proxy_dir / filename
+            write(destination, (current / filename).read_bytes(), 0o640)
+            os.chown(destination, 0, proxy_gid)
     return renew
 
 
-def refresh(root, public, tls, gateway, portal_gid, rotate=False):
+def refresh(root, public, tls, gateway, portal_gid, rotate=False, proxy_dir=None, proxy_gid=None):
     # Serialize timer renewal, installation and browser-requested CA rotation.
     lock_path = Path(root).parent / 'ca-lifecycle.lock'
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     with os.fdopen(descriptor, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         provision(root, gateway, rotate)
-        return publish(root, public, tls, gateway, portal_gid)
+        return publish(root, public, tls, gateway, portal_gid, proxy_dir=proxy_dir, proxy_gid=proxy_gid)

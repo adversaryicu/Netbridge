@@ -1,0 +1,37 @@
+[Unit]
+Description=NetBridge transparent TLS inspection proxy
+After=netbridge-ap.service netbridge-controller.service
+Wants=netbridge-controller.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=netbridge-proxy
+Group=netbridge-proxy
+ExecStart=/usr/local/lib/netbridge/mitm-venv/bin/mitmdump -q --mode transparent@0.0.0.0:8080 --set confdir=/etc/netbridge/proxy-ca --set block_global=false --set command_history=false --set rawtcp=true --set stream_large_bodies=524288 --set validate_inbound_headers=false --set connection_strategy=lazy --set keep_host_header=true --set flow_detail=0 --set termlog_verbosity=error -s /usr/local/lib/netbridge/portal/proxy_addon.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+InaccessiblePaths=/var/lib/netbridge/ca
+ReadWritePaths=/run/netbridge
+MemoryHigh=96M
+MemoryMax=128M
+TasksMax=32
+LimitNOFILE=512
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=MALLOC_ARENA_MAX=1
+Environment=MALLOC_TRIM_THRESHOLD_=32768
+
+[Install]
+WantedBy=multi-user.target

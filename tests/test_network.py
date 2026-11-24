@@ -20,6 +20,14 @@ class NetworkTests(unittest.TestCase):
     def test_valid_defaults(self):
         network.validate(self.config)
 
+    def test_firewall_includes_inspection_redirect_and_quic_block(self):
+        rules = network.firewall(self.config, self.state)
+        self.assertIn('set inspected_v4', rules)
+        self.assertIn('chain prerouting', rules)
+        self.assertIn('ip saddr @inspected_v4 ip daddr != 192.168.50.1 ip daddr != @protected_v4 tcp dport != 53 counter redirect to :8080', rules)
+        self.assertIn('ip saddr @inspected_v4 ct status dnat tcp dport 8080 counter accept', rules)
+        self.assertIn('ip saddr @inspected_v4 udp dport 443 counter reject', rules)
+
     def test_reject_gateway_in_pool(self):
         self.config['lan']['dhcp_start'] = '192.168.50.1'
         with self.assertRaises(ValueError):

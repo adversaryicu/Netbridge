@@ -12,8 +12,8 @@ import urllib.request
 
 ROOT = Path('/usr/local/lib/netbridge')
 SNAPSHOT = Path('/run/netbridge-session-state.json')
-UNITS = ['netbridge-certificate-renew.timer', 'netbridge-certificate-renew.service', 'netbridge-portal.service',
-         'netbridge-controller.service', 'netbridge-ap.service']
+UNITS = ['netbridge-proxy.service', 'netbridge-certificate-renew.timer', 'netbridge-certificate-renew.service',
+         'netbridge-portal.service', 'netbridge-controller.service', 'netbridge-ap.service']
 
 
 def command(*args, check=True):
@@ -63,7 +63,7 @@ def serve():
     deadline = time.monotonic() + 30
     while True:
         try:
-            with urllib.request.urlopen('https://' + gateway + '/', context=context, timeout=2) as response:
+            with urllib.request.urlopen('https://' + gateway + '/api/public', context=context, timeout=2) as response:
                 if response.status != 200:
                     raise RuntimeError('Portal health check failed')
             break

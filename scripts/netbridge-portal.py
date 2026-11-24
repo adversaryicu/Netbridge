@@ -16,11 +16,41 @@ import tomllib
 
 SOURCE = Path(__file__).resolve().parents[1]
 INSTALL = Path('/usr/local/lib/netbridge/portal')
+VENV = Path('/usr/local/lib/netbridge/mitm-venv')
 BASE = Path('/var/lib/netbridge')
+PROXY_CA = Path('/etc/netbridge/proxy-ca')
+MITMPROXY_VERSION = '12.3.1'
 
 
-def run(*args):
-    subprocess.run(args, check=True, timeout=90)
+def run(*args, timeout=90):
+    subprocess.run(args, check=True, timeout=timeout)
+
+
+def ensure_service_account(username):
+    try:
+        account = pwd.getpwnam(username)
+    except KeyError:
+        run('useradd', '--system', '--user-group', '--no-create-home', '--home-dir', '/nonexistent', '--shell', '/usr/sbin/nologin', username)
+        account = pwd.getpwnam(username)
+    if account.pw_shell != '/usr/sbin/nologin':
+        raise SystemExit(f'Existing {username} account is not a dedicated service account')
+    return account
+
+
+def ensure_mitm_venv():
+    mitmdump = VENV / 'bin/mitmdump'
+    if not mitmdump.exists():
+        run('/usr/bin/python3', '-m', 'venv', str(VENV), timeout=180)
+        run(str(VENV / 'bin/pip'), 'install', '--only-binary=:all:', f'mitmproxy=={MITMPROXY_VERSION}', timeout=600)
+    for root, dirs, files in os.walk(VENV):
+        os.chmod(root, 0o755)
+        for name in dirs:
+            os.chmod(Path(root) / name, 0o755)
+        for name in files:
+            target = Path(root) / name
+            if not target.is_symlink():
+                mode = target.stat().st_mode
+                os.chmod(target, 0o755 if (mode & 0o111) else 0o644)
 
 
 def module():
@@ -42,25 +72,30 @@ def install():
     import cryptography
     config = tomllib.loads(Path('/etc/netbridge/phase1.toml').read_text())
     gateway = str(ipaddress.ip_interface(config['lan']['cidr']).ip)
-    try:
-        account = pwd.getpwnam('netbridge-portal')
-    except KeyError:
-        run('useradd', '--system', '--user-group', '--no-create-home', '--home-dir', '/nonexistent', '--shell', '/usr/sbin/nologin', 'netbridge-portal')
-        account = pwd.getpwnam('netbridge-portal')
-    if account.pw_shell != '/usr/sbin/nologin':
-        raise SystemExit('Existing netbridge-portal account is not a dedicated service account')
+    account = ensure_service_account('netbridge-portal')
+    proxy_account = ensure_service_account('netbridge-proxy')
+    ensure_mitm_venv()
     INSTALL.mkdir(parents=True, exist_ok=True)
     shutil.copytree(SOURCE / 'portal', INSTALL, dirs_exist_ok=True, ignore=shutil.ignore_patterns('__pycache__'))
     for path in INSTALL.rglob('*'):
         os.chmod(path, 0o755 if path.is_dir() else 0o644)
     pki = module()
-    pki.refresh(BASE / 'ca', BASE / 'portal-public', Path('/etc/netbridge/portal-tls'), gateway, account.pw_gid)
+    pki.refresh(BASE / 'ca', BASE / 'portal-public', Path('/etc/netbridge/portal-tls'), gateway, account.pw_gid,
+                proxy_dir=PROXY_CA, proxy_gid=proxy_account.pw_gid)
+    dhparam = subprocess.check_output([
+        str(VENV / 'bin/python3'), '-c',
+        'from mitmproxy.certs import DEFAULT_DHPARAM; import sys; sys.stdout.buffer.write(DEFAULT_DHPARAM)',
+    ], timeout=30)
+    dhparam_path = PROXY_CA / 'mitmproxy-dhparam.pem'
+    pki.write(dhparam_path, dhparam, 0o640)
+    os.chown(dhparam_path, 0, proxy_account.pw_gid)
     pki.write('/etc/netbridge/portal.json', json.dumps({'gateway': gateway}), 0o644)
-    for filename in ('netbridge-controller.service', 'netbridge-portal.service', 'netbridge-certificate-renew.service', 'netbridge-certificate-renew.timer'):
+    for filename in ('netbridge-controller.service', 'netbridge-portal.service', 'netbridge-proxy.service',
+                     'netbridge-certificate-renew.service', 'netbridge-certificate-renew.timer'):
         pki.write(Path('/etc/systemd/system') / filename, (SOURCE / 'systemd' / filename).read_bytes(), 0o644)
     pki.write('/usr/local/lib/netbridge/netbridge-portal.py', Path(__file__).read_bytes(), 0o755)
     run('systemctl', 'daemon-reload')
-    print('Portal installed without boot startup. Open NetBridge to start it. CA identity retained.')
+    print('Portal and proxy installed without boot startup. Open NetBridge to start it. CA identity retained.')
     print('Onboarding: http://' + gateway + '/  Administration: https://' + gateway + '/admin')
 
 
@@ -79,13 +114,20 @@ def main():
     elif args.action == 'renew':
         gateway = json.loads(Path('/etc/netbridge/portal.json').read_text())['gateway']
         account = pwd.getpwnam('netbridge-portal')
-        if module().refresh(BASE / 'ca', BASE / 'portal-public', Path('/etc/netbridge/portal-tls'), gateway, account.pw_gid):
+        try:
+            proxy_gid = pwd.getpwnam('netbridge-proxy').pw_gid
+            proxy_dir = PROXY_CA
+        except KeyError:
+            proxy_gid = None
+            proxy_dir = None
+        if module().refresh(BASE / 'ca', BASE / 'portal-public', Path('/etc/netbridge/portal-tls'), gateway,
+                            account.pw_gid, proxy_dir=proxy_dir, proxy_gid=proxy_gid):
             run('systemctl', 'restart', 'netbridge-portal')
             print('Renewed portal leaf certificate; CA identity unchanged.')
     else:
         run('systemctl', 'disable', '--now', 'netbridge-certificate-renew.timer')
-        run('systemctl', 'disable', '--now', 'netbridge-portal', 'netbridge-controller')
-        print('Portal and controller stopped. CA/admin data retained; Internet sharing is unchanged.')
+        run('systemctl', 'disable', '--now', 'netbridge-proxy', 'netbridge-portal', 'netbridge-controller')
+        print('Portal, proxy and controller stopped. CA/admin data retained; Internet sharing is unchanged.')
 
 
 if __name__ == '__main__':

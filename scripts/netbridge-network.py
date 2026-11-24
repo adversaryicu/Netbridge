@@ -91,7 +91,9 @@ def check_conflicts(config, routes, lan_interface):
 
 def firewall(config, state):
     lan, wan = state['lan'], state['wan']
-    subnet = str(ipaddress.IPv4Interface(config['lan']['cidr']).network)
+    interface = ipaddress.IPv4Interface(config['lan']['cidr'])
+    gateway = str(interface.ip)
+    subnet = str(interface.network)
     return f'''add table inet netbridge
 flush table inet netbridge
 table inet netbridge {{
@@ -100,6 +102,13 @@ table inet netbridge {{
     elements = {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
       169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }}
   }}
+  set inspected_v4 {{
+    type ipv4_addr;
+  }}
+  chain prerouting {{
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname "{lan}" ip saddr @inspected_v4 ip daddr != {gateway} ip daddr != @protected_v4 tcp dport != 53 counter redirect to :8080
+  }}
   chain input {{
     type filter hook input priority -10; policy accept;
     iifname "{lan}" meta nfproto ipv6 counter drop
@@ -107,6 +116,7 @@ table inet netbridge {{
     iifname "{lan}" ip saddr != {subnet} counter drop
     iifname "{lan}" udp dport 53 counter accept
     iifname "{lan}" tcp dport {{ 53, 80, 443 }} counter accept
+    iifname "{lan}" ip saddr @inspected_v4 ct status dnat tcp dport 8080 counter accept
     iifname "{lan}" icmp type echo-request limit rate 10/second counter accept
     iifname "{lan}" counter reject
   }}
@@ -116,6 +126,7 @@ table inet netbridge {{
     oifname "{lan}" meta nfproto ipv6 counter drop
     iifname "{lan}" ip saddr != {subnet} counter drop
     iifname "{lan}" ip daddr @protected_v4 counter reject
+    iifname "{lan}" ip saddr @inspected_v4 udp dport 443 counter reject
     iifname "{lan}" oifname "{wan}" ct state {{ new, established, related }} counter accept
     iifname "{lan}" counter reject
     iifname "{wan}" oifname "{lan}" ct state {{ established, related }} counter accept

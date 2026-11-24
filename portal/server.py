@@ -1,25 +1,42 @@
 #!/usr/bin/env python3
 """Bounded h11 HTTP/1.1 facade; the separate controller owns authorization."""
 import asyncio
-import gc
+import base64
 from collections import OrderedDict
+import csv
+import gc
 from http.cookies import SimpleCookie, CookieError
+import io
 import json
 import logging
 from pathlib import Path
 import signal
 import ssl
 import time
+from urllib.parse import parse_qs, urlsplit
 
 import h11
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC = Path('/var/lib/netbridge/portal-public')
 TLS = Path('/etc/netbridge/portal-tls')
+FLOWS_DIR = Path('/run/netbridge/flows')
 SOCKET = '/run/netbridge/control.sock'
 COOKIE = '__Host-netbridge'
 MAX_BODY = 4096
 MAX_HEADERS = 8192
+MAX_PREVIEW_BYTES = 32768
+SAFE_IMAGE_TYPES = frozenset({
+    'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+    'image/x-icon', 'image/vnd.microsoft.icon', 'image/bmp',
+})
+EXT_MAP = {
+    'application/json': '.json', 'text/html': '.html', 'application/javascript': '.js',
+    'text/javascript': '.js', 'text/css': '.css', 'text/plain': '.txt', 'text/xml': '.xml',
+    'application/xml': '.xml', 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif',
+    'image/webp': '.webp', 'image/svg+xml': '.svg', 'image/x-icon': '.ico',
+    'application/pdf': '.pdf', 'application/zip': '.zip',
+}
 SECURITY_HEADERS = {
     'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY',
@@ -39,10 +56,189 @@ def json_response(data, status=200):
     return Response(status, json.dumps(data), 'application/json; charset=utf-8')
 
 
+def format_hex_dump(data, limit=None):
+    view = data[:limit] if limit is not None else data
+    lines = []
+    for offset in range(0, len(view), 16):
+        chunk = view[offset:offset + 16]
+        left = ' '.join(f'{b:02x}' for b in chunk[:8])
+        right = ' '.join(f'{b:02x}' for b in chunk[8:])
+        hex_col = f'{left:<23}  {right:<23}'
+        ascii_col = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+        lines.append(f'{offset:08x}  {hex_col}  |{ascii_col}|')
+    return '\n'.join(lines)
+
+
+def is_text_payload(data, content_type=''):
+    if not data:
+        return True
+    ctype = (content_type or '').lower()
+    if ctype.startswith('text/') or any(tok in ctype for tok in ('json', 'javascript', 'xml', 'form-urlencoded', 'yaml', 'csv', 'svg')):
+        return b'\x00' not in data[:4096]
+    if b'\x00' in data[:4096]:
+        return False
+    sample = data[:8192]
+    try:
+        text = sample.decode('utf-8')
+    except UnicodeDecodeError:
+        return False
+    printable = sum(1 for ch in text if ch in '\r\n\t' or ord(ch) >= 32)
+    return (printable / max(1, len(text))) >= 0.90
+
+
+def build_payload_view(raw, content_type='', truncated=False, total_bytes=None):
+    ctype = (content_type or '').lower()
+    captured = len(raw)
+    size = total_bytes if total_bytes is not None else captured
+    is_text = is_text_payload(raw, ctype)
+    return {
+        'size': size,
+        'captured': captured,
+        'truncated': bool(truncated),
+        'content_type': ctype,
+        'is_text': is_text,
+        'is_image': ctype in SAFE_IMAGE_TYPES or ctype == 'image/svg+xml',
+        'is_inline_image': ctype in SAFE_IMAGE_TYPES,
+        'text': raw[:MAX_PREVIEW_BYTES].decode('utf-8', errors='replace') if (raw and is_text) else '',
+        'text_truncated': len(raw) > MAX_PREVIEW_BYTES and is_text,
+        'hex': format_hex_dump(raw, limit=MAX_PREVIEW_BYTES) if raw else '',
+        'hex_truncated': len(raw) > MAX_PREVIEW_BYTES,
+    }
+
+
+def _read_flow_record(flow_id, flows_dir=None):
+    flows_dir = flows_dir or FLOWS_DIR
+    meta_path = flows_dir / f'{flow_id}.json'
+    if not meta_path.is_file():
+        raise Reject(404, 'Flow details unavailable or evicted')
+    meta = json.loads(meta_path.read_text())
+    meta.setdefault('id', flow_id)
+    if 'req_b64' in meta:
+        req_raw = base64.b64decode(meta.pop('req_b64') or '')
+    else:
+        req_path = flows_dir / f'{flow_id}.req'
+        req_raw = req_path.read_bytes() if req_path.is_file() else b''
+    if 'resp_b64' in meta:
+        resp_raw = base64.b64decode(meta.pop('resp_b64') or '')
+    else:
+        resp_path = flows_dir / f'{flow_id}.resp'
+        resp_raw = resp_path.read_bytes() if resp_path.is_file() else b''
+    return meta, req_raw, resp_raw
+
+
+def build_flow_detail(flow_id, flows_dir=None):
+    meta, req_raw, resp_raw = _read_flow_record(flow_id, flows_dir)
+    return {
+        'flow': meta,
+        'request': build_payload_view(req_raw, meta.get('req_content_type', ''), meta.get('req_truncated', False), meta.get('req_bytes')),
+        'response': build_payload_view(resp_raw, meta.get('content_type', ''), meta.get('resp_truncated', False), meta.get('bytes')),
+    }
+
+
+def build_export(fmt, ids, flows_dir=None):
+    flows_dir = flows_dir or FLOWS_DIR
+    if fmt == 'csv':
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(['id', 'time', 'client_ip', 'server_ip', 'server_port', 'method', 'scheme',
+                         'host', 'path', 'status', 'content_type', 'req_bytes', 'resp_bytes',
+                         'duration_ms', 'state', 'detail'])
+        for flow_id in ids:
+            meta_path = flows_dir / f'{flow_id}.json'
+            if not meta_path.is_file():
+                continue
+            m = json.loads(meta_path.read_text())
+            writer.writerow([
+                m.get('id', flow_id), m.get('time', ''), m.get('client_ip', ''), m.get('server_ip', ''),
+                m.get('server_port', 0), m.get('method', ''), m.get('scheme', ''), m.get('host', ''),
+                m.get('path', ''), m.get('status', 0), m.get('content_type', ''), m.get('req_bytes', 0),
+                m.get('bytes', 0), m.get('duration_ms', 0), m.get('state', ''), m.get('detail', ''),
+            ])
+        return buf.getvalue().encode('utf-8'), 'text/csv; charset=utf-8', 'csv'
+    if fmt == 'jsonl':
+        lines = []
+        for flow_id in ids:
+            try:
+                m, req_raw, resp_raw = _read_flow_record(flow_id, flows_dir)
+            except Reject:
+                continue
+            if req_raw:
+                m['request_base64'] = base64.b64encode(req_raw).decode('ascii')
+                if is_text_payload(req_raw, m.get('req_content_type', '')):
+                    m['request_text'] = req_raw.decode('utf-8', errors='replace')
+            if resp_raw:
+                m['response_base64'] = base64.b64encode(resp_raw).decode('ascii')
+                if is_text_payload(resp_raw, m.get('content_type', '')):
+                    m['response_text'] = resp_raw.decode('utf-8', errors='replace')
+            lines.append(json.dumps(m))
+        return ('\n'.join(lines) + ('\n' if lines else '')).encode('utf-8'), 'application/x-ndjson; charset=utf-8', 'jsonl'
+    if fmt == 'har':
+        entries = []
+        for flow_id in ids:
+            try:
+                m, req_raw, resp_raw = _read_flow_record(flow_id, flows_dir)
+            except Reject:
+                continue
+            scheme = m.get('scheme', 'http')
+            host = m.get('host', '')
+            path = m.get('path', '/')
+            url = f'{scheme}://{host}{path}' if host else path
+            req_headers = [{'name': k, 'value': v} for k, v in m.get('request_headers', [])]
+            resp_headers = [{'name': k, 'value': v} for k, v in m.get('response_headers', [])]
+            query_str = urlsplit(path).query
+            qparams = [{'name': k, 'value': v} for k, vals in parse_qs(query_str, keep_blank_values=True).items() for v in vals]
+            req_obj = {
+                'method': m.get('method', 'GET'),
+                'url': url,
+                'httpVersion': m.get('http_version', 'HTTP/1.1'),
+                'headers': req_headers,
+                'queryString': qparams,
+                'cookies': [],
+                'headersSize': -1,
+                'bodySize': m.get('req_bytes', len(req_raw)),
+            }
+            if req_raw:
+                if is_text_payload(req_raw, m.get('req_content_type', '')):
+                    req_obj['postData'] = {'mimeType': m.get('req_content_type', 'application/octet-stream'), 'text': req_raw.decode('utf-8', errors='replace')}
+                else:
+                    req_obj['postData'] = {'mimeType': m.get('req_content_type', 'application/octet-stream'), 'text': base64.b64encode(req_raw).decode('ascii'), 'encoding': 'base64'}
+            resp_content = {'size': m.get('bytes', len(resp_raw)), 'mimeType': m.get('content_type', 'application/octet-stream')}
+            if resp_raw:
+                if is_text_payload(resp_raw, m.get('content_type', '')):
+                    resp_content['text'] = resp_raw.decode('utf-8', errors='replace')
+                else:
+                    resp_content['text'] = base64.b64encode(resp_raw).decode('ascii')
+                    resp_content['encoding'] = 'base64'
+            entries.append({
+                'startedDateTime': m.get('time', ''),
+                'time': m.get('duration_ms', 0),
+                'request': req_obj,
+                'response': {
+                    'status': m.get('status', 0),
+                    'statusText': m.get('reason', ''),
+                    'httpVersion': m.get('resp_http_version', 'HTTP/1.1'),
+                    'headers': resp_headers,
+                    'cookies': [],
+                    'content': resp_content,
+                    'redirectURL': '',
+                    'headersSize': -1,
+                    'bodySize': m.get('bytes', len(resp_raw)),
+                },
+                'cache': {},
+                'timings': {'send': 0, 'wait': m.get('duration_ms', 0), 'receive': 0},
+                'serverIPAddress': m.get('server_ip', ''),
+            })
+        har = {'log': {'version': '1.2', 'creator': {'name': 'NetBridge', 'version': '1.0'}, 'entries': entries}}
+        return json.dumps(har, indent=2).encode('utf-8'), 'application/json; charset=utf-8', 'har'
+    raise Reject(400, 'Unsupported export format')
+
+
 class Request:
     def __init__(self, event, body, remote, secure):
         self.method = event.method.decode('ascii')
-        self.path = event.target.decode('ascii').split('?', 1)[0]
+        target = event.target.decode('ascii')
+        self.path, _, self.query_string = target.partition('?')
+        self.query = parse_qs(self.query_string, keep_blank_values=True)
         self.headers = {k.decode('ascii'):v.decode('latin1') for k,v in event.headers}
         self.body, self.remote, self.secure = body, remote, secure
 
@@ -53,11 +249,16 @@ class Reject(Exception):
 
 
 async def rpc(payload):
-    reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(SOCKET, limit=32768), 3)
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(SOCKET, limit=131072), 3)
+    except OSError as error:
+        raise RuntimeError('Controller socket unavailable') from error
     try:
         writer.write(json.dumps(payload).encode() + b'\n')
         await writer.drain()
-        return json.loads(await asyncio.wait_for(reader.readline(), 15))
+        return json.loads(await asyncio.wait_for(reader.readline(), 22))
+    except OSError as error:
+        raise RuntimeError('Controller IPC failed') from error
     finally:
         writer.close()
         await writer.wait_closed()
@@ -94,10 +295,10 @@ class Portal:
         if count >= 300:
             raise Reject(429, 'Too many requests; wait one minute')
         static = {'/': ('index.html', 'text/html'), '/admin': ('index.html', 'text/html'),
-                  '/trust': ('index.html', 'text/html'), '/app.js': ('app.js', 'application/javascript'),
-                  '/style.css': ('style.css', 'text/css')}
+                  '/trust': ('index.html', 'text/html'), '/inspector': ('index.html', 'text/html'),
+                  '/app.js': ('app.js', 'application/javascript'), '/style.css': ('style.css', 'text/css')}
         if request.path in static and request.method in ('GET', 'HEAD'):
-            if request.path in ('/admin', '/trust') and not request.secure:
+            if request.path in ('/admin', '/trust', '/inspector') and not request.secure:
                 return Response(302, headers={'Location':f'https://{self.gateway}{request.path}'})
             name, kind = static[request.path]
             return Response(body=(ROOT / 'static' / name).read_bytes(), content_type=kind)
@@ -112,9 +313,9 @@ class Portal:
                     pass
             return Response(body=pem, content_type='application/x-x509-ca-cert',
                             headers={'Content-Disposition':'attachment; filename="NetBridge-CA.crt"'})
-        reads = {'public', 'status', 'trust-probe'}
+        reads = {'public', 'status', 'trust-probe', 'flow', 'flow-raw', 'flows-export'}
         writes = {'pair', 'login', 'logout', 'trust-confirm', 'approve', 'revoke',
-                  'admin-password', 'rotate-ca', 'ap-settings'}
+                  'admin-password', 'rotate-ca', 'ap-settings', 'inspection', 'flows-clear'}
         action = request.path[5:] if request.path.startswith('/api/') else ''
         if not ((request.method == 'GET' and action in reads) or (request.method == 'POST' and action in writes)):
             raise Reject(404, 'Not found')
@@ -133,6 +334,44 @@ class Portal:
         except CookieError:
             raise Reject(400, 'Invalid cookie')
         session = cookies[COOKIE].value if COOKIE in cookies else ''
+        if action in ('flow', 'flow-raw', 'flows-export'):
+            auth = await rpc({'action': 'flow-index', 'ip': request.remote, 'secure': request.secure,
+                              'session': session, 'csrf': '', 'data': {}})
+            if auth['status'] != 200:
+                return json_response(auth['data'], auth['status'])
+            valid_ids = set(auth['data'].get('ids', []))
+            if action == 'flows-export':
+                fmt = request.query.get('format', ['jsonl'])[0].lower()
+                payload, ctype, ext = build_export(fmt, auth['data'].get('ids', []))
+                return Response(body=payload, content_type=ctype,
+                                headers={'Content-Disposition': f'attachment; filename="netbridge-capture.{ext}"'})
+            try:
+                flow_id = int(request.query.get('id', [''])[0])
+            except ValueError:
+                raise Reject(400, 'Invalid flow ID')
+            if flow_id < 1 or flow_id not in valid_ids:
+                raise Reject(404, 'Flow not found')
+            if action == 'flow':
+                return json_response(build_flow_detail(flow_id))
+            part = request.query.get('part', ['response'])[0]
+            if part not in ('request', 'response'):
+                raise Reject(400, 'Invalid payload part')
+            fmt = request.query.get('format', ['raw'])[0]
+            if fmt not in ('raw', 'hex'):
+                raise Reject(400, 'Invalid format')
+            download = request.query.get('download', ['0'])[0] == '1'
+            meta, req_raw, resp_raw = _read_flow_record(flow_id)
+            raw_bytes = req_raw if part == 'request' else resp_raw
+            if fmt == 'hex':
+                return Response(body=format_hex_dump(raw_bytes).encode('utf-8'),
+                                content_type='text/plain; charset=utf-8',
+                                headers={'Content-Disposition': f'attachment; filename="flow-{flow_id}-{part}.hex"'})
+            ctype = (meta.get('req_content_type', '') if part == 'request' else meta.get('content_type', '')).lower()
+            if not download and ctype in SAFE_IMAGE_TYPES:
+                return Response(body=raw_bytes, content_type=ctype)
+            ext = EXT_MAP.get(ctype, '.bin')
+            return Response(body=raw_bytes, content_type='application/octet-stream',
+                            headers={'Content-Disposition': f'attachment; filename="flow-{flow_id}-{part}{ext}"'})
         result = await rpc({'action':action, 'ip':request.remote, 'secure':request.secure,
                             'session':session, 'csrf':request.headers.get('x-netbridge-csrf', ''), 'data':data})
         body = result['data']
@@ -188,7 +427,7 @@ class Portal:
                 event, body = await asyncio.wait_for(self.receive(connection, reader), 5)
                 remote = writer.get_extra_info('peername')[0]
                 request = Request(event, body, remote, writer.get_extra_info('ssl_object') is not None)
-                response = await asyncio.wait_for(self.route(request), 20)
+                response = await asyncio.wait_for(self.route(request), 25)
             except Reject as error:
                 response = json_response({'error':error.message}, error.status)
             except (h11.RemoteProtocolError, UnicodeError, ValueError):
@@ -207,7 +446,7 @@ class Portal:
             if event is None or event.method != b'HEAD':
                 writer.write(connection.send(h11.Data(data=response.body)))
             writer.write(connection.send(h11.EndOfMessage()))
-            await asyncio.wait_for(writer.drain(), 5)
+            await asyncio.wait_for(writer.drain(), 15)
         except (h11.LocalProtocolError, ConnectionError, OSError, asyncio.TimeoutError):
             pass
         finally:

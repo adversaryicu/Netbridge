@@ -2,45 +2,316 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="NetBridge local certificate onboarding and device administration.">
-  <title>NetBridge · Local gateway</title>
+  <meta name="description" content="NetBridge local certificate onboarding, gateway administration, and traffic telemetry.">
+  <title>NetBridge // Adversary ICU</title>
   <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
 </head>
 <body>
-<header><a class="brand" href="/" aria-label="NetBridge home"><span class="brand-mark">N<span>B</span></span>NetBridge</a><span class="local-label">LOCAL GATEWAY</span></header>
-<main>
-  <section class="hero"><div><p class="eyebrow">YOUR DEVICE. YOUR TEST NETWORK.</p><h1 id="page-title">Connect with confidence.</h1><p class="intro" id="page-intro">Install this gateway’s certificate, check trust in your browser, then manage your authorized test devices.</p></div><div class="state-pill">Inspection off</div></section>
-  <div id="notice" role="status" aria-live="polite" hidden></div>
-  <nav aria-label="Portal"><a href="/" id="onboard-link">Set up this device</a><a href="/trust" id="trust-link">Check trust</a><a href="/admin" id="admin-link">Administration</a></nav>
-  <section id="onboarding" hidden>
-    <div class="split"><article class="panel"><p class="eyebrow">CERTIFICATE SETUP</p><h2>A private CA for this Cardputer.</h2><p>Only install this certificate on devices you own or are authorized to test. It allows this gateway to inspect HTTPS when you explicitly enable inspection in a later phase.</p><p>Installing a CA does not enable inspection and does not make every app inspectable.</p><a class="button primary" href="/ca.crt">Download CA certificate</a><a class="text-link" href="/trust" id="check-link">I’ve installed it. Check browser trust.</a></article>
-    <aside class="panel certificate"><p class="eyebrow">VERIFY BEFORE YOU TRUST</p><h2 id="ca-name">Loading certificate…</h2><dl><dt>SHA-256 fingerprint</dt><dd class="fingerprint" id="fingerprint">Connecting to the gateway</dd><dt>Valid until</dt><dd id="ca-expiry">—</dd></dl><p class="small">Compare the full fingerprint with the operator’s device or trusted SSH output. A fingerprint shown only on this HTTP page is not an independent verification.</p></aside></div>
-    <section class="guides"><h2>Install and remove the certificate</h2><p>Choose your platform. Menu names may vary by OS version. Restart the browser after changing trust.</p>
-      <details open><summary>Windows</summary><p>Open the downloaded certificate, choose <strong>Install Certificate</strong>, and select <strong>Current User</strong>. Choose <strong>Place all certificates in the following store</strong>, then <strong>Trusted Root Certification Authorities</strong>. Verify the NetBridge name and fingerprint before accepting.</p><p>To remove it, open <code>certmgr.msc</code>, find this NetBridge CA under Trusted Root Certification Authorities → Certificates, and delete only that certificate.</p></details>
-      <details><summary>macOS</summary><p>Open the certificate in Keychain Access and add it to your login or System keychain. Open the imported NetBridge certificate, expand Trust, and explicitly trust it for SSL. You may need an administrator password.</p><p>To remove it, find this exact NetBridge CA in Keychain Access and delete it.</p></details>
-      <details><summary>iPhone and iPad</summary><p>Download the certificate in Safari and install the downloaded profile from Settings → General → VPN &amp; Device Management. Then open Settings → General → About → Certificate Trust Settings and enable full trust for this NetBridge CA.</p><p>To remove it, delete the NetBridge profile under VPN &amp; Device Management. <a href="https://support.apple.com/en-us/102390" target="_blank" rel="noreferrer">Apple’s trust instructions</a>.</p></details>
-      <details><summary>Android</summary><p>In Settings, find Security or Security &amp; privacy → More security settings → Encryption &amp; credentials → Install a certificate → CA certificate, then select the downloaded file. A device lock and a security confirmation may be required.</p><p>Many apps do not accept user-installed CAs, even when your browser trusts this one. To remove it, select this NetBridge CA in user credentials/trusted credentials and remove it. <a href="https://support.google.com/pixelphone/answer/2844832?hl=en" target="_blank" rel="noreferrer">Google’s certificate instructions</a>.</p></details>
-      <details><summary>Linux and Firefox</summary><p>For Debian/Ubuntu system trust, save the certificate with a <code>.crt</code> extension under <code>/usr/local/share/ca-certificates/</code> and run <code>sudo update-ca-certificates</code>. To remove it, delete that specific file and run the command again. Other distributions use different trust tools.</p><p>If Firefox does not use your system trust, open Settings → Privacy &amp; Security → Certificates → View Certificates → Authorities, import this CA, and allow it to identify websites. Remove the same CA from Authorities when finished. <a href="https://support.mozilla.org/en-US/kb/setting-certificate-authorities-firefox" target="_blank" rel="noreferrer">Mozilla’s CA guidance</a>.</p></details>
-    </section>
-    <p class="footnote">CA rotation replaces this identity. Remove the old certificate, install the new one, and repeat the trust check. Pinned apps, VPNs and app-specific trust rules can still prevent inspection.</p>
-  </section>
-  <section id="trust" hidden>
-    <article class="panel narrow"><p class="eyebrow">BROWSER TRUST CHECK</p><h2 id="trust-title">Checking your HTTPS connection…</h2><p id="trust-copy">Connect this device to NetBridge Wi-Fi first.</p><form id="trust-form" hidden><label class="check"><input type="checkbox" id="no-warning" required><span>I installed the correct NetBridge CA and reached this page without bypassing a certificate warning.</span></label><button class="primary" type="submit">Confirm this browser’s trust</button></form><p class="small">A server cannot tell whether you bypassed a browser certificate warning. Your confirmation is required. This check applies to this browser, not every app, and expires when this device disconnects.</p></article>
-  </section>
-  <section id="authentication" hidden>
-    <article class="panel narrow"><p class="eyebrow">GATEWAY ADMINISTRATION</p><h2 id="auth-title">Sign in</h2><p id="auth-copy">Use your NetBridge administrator password. This is separate from the Wi-Fi password.</p><form id="auth-form"><div id="pair-field" hidden><label for="pair-code">One-time pairing code</label><input id="pair-code" autocomplete="off" maxlength="64"><p class="small">Generated locally by the operator. Expires after 15 minutes.</p></div><label for="admin-password">Administrator password</label><input id="admin-password" type="password" autocomplete="current-password" minlength="12" maxlength="128" required><button class="primary" id="auth-submit" type="submit">Sign in</button></form></article>
-  </section>
-  <section id="dashboard" hidden>
-    <div class="dashboard-heading"><h2>Your gateway</h2><button class="quiet" id="logout">Sign out</button></div>
-    <div class="metrics"><article><span>ETHERNET</span><strong id="wan-state">Checking</strong></article><article><span>TEST DEVICES</span><strong id="client-count">0</strong></article><article><span>HTTPS INSPECTION</span><strong>Off</strong></article></div>
-    <div class="section-heading"><div><h2>Connected devices</h2><p>Approval lasts for the current Wi-Fi connection. Approving a device does not start inspection.</p></div><button class="quiet" id="refresh">Refresh</button></div>
-    <div id="clients" class="clients"></div>
-    <div class="split settings">
-      <article class="panel"><h2>Wi-Fi settings</h2><p>Saving restarts the hotspot and disconnects its clients. Reconnect with the new credentials.</p><form id="wifi-form"><label for="ssid">Network name</label><input id="ssid" maxlength="32" required><label for="wifi-password">New Wi-Fi password</label><input id="wifi-password" type="password" minlength="8" maxlength="63" autocomplete="new-password" required><button type="submit">Save Wi-Fi settings</button></form></article>
-      <article class="panel"><h2>Administrator password</h2><p>Use at least 12 characters. Changing it signs out every administrator session.</p><form id="password-form"><label for="new-password">New administrator password</label><input id="new-password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required><button type="submit">Change administrator password</button></form></article>
+<header class="site-header">
+  <div class="site-shell site-header__inner">
+    <div class="site-brand">
+      <a href="/" class="site-brand__mark">NETBRIDGE // ADVERSARY ICU</a>
+      <p class="site-brand__descriptor">Field Gateway, Certificate Onboarding, and Traffic Telemetry</p>
+      <p class="site-brand__meta">
+        <span>NODE // <strong id="meta-gateway">192.168.50.1</strong></span>
+        <span>INSPECTION // <strong id="meta-inspection" class="state-off">off</strong></span>
+        <span>WAN // <strong id="meta-wan">—</strong></span>
+      </p>
     </div>
-    <article class="panel danger"><div><p class="eyebrow">CERTIFICATE LIFECYCLE</p><h2>Replace the device CA</h2><p>This breaks existing CA trust and signs out administrators. Every test device must install the new certificate and repeat onboarding. The old CA is never silently reused.</p></div><form id="rotate-form"><label for="rotate-confirm">Type ROTATE to confirm</label><input id="rotate-confirm" placeholder="ROTATE" autocomplete="off" required><button type="submit" class="danger-button">Generate a new CA</button></form></article>
-  </section>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="site-nav__link" href="/" id="nav-setup">Device Setup</a>
+      <a class="site-nav__link" href="/admin" id="nav-admin">Administration</a>
+      <a class="site-nav__link" href="/inspector" id="nav-inspector">Traffic Inspector</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main-content">
+  <div class="site-shell" id="page-shell">
+    <div id="notice" role="status" aria-live="polite" hidden></div>
+
+    <section id="setup" hidden>
+      <header class="section-page-header">
+        <p class="entry-marker">Gateway Onboarding</p>
+        <h1 class="article-title">Device Setup &amp; Certificate Trust</h1>
+        <p class="article-dek">Install the device-local root CA on authorized test hardware, then verify HTTPS trust directly below.</p>
+      </header>
+
+      <section class="page-section">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="section-heading__label">01</p>
+            <h2 class="section-heading__title">Certificate Authority</h2>
+          </div>
+          <p class="section-heading__utility">$ curl -O http://192.168.50.1/ca.crt</p>
+        </div>
+
+        <div class="setup-grid">
+          <article class="panel">
+            <p class="eyebrow">CA PROVISIONING</p>
+            <h3>Install only on authorized test hardware</h3>
+            <p>This gateway signs TLS leaf certificates dynamically when inspection is explicitly enabled. Installing the root CA does not enable interception by itself, and pinned apps or VPN tunnels remain un-decrypted.</p>
+            <div class="action-row">
+              <a class="button primary" href="/ca.crt">Download NetBridge-CA.crt --&gt;</a>
+              <a class="button quiet" href="#trust-section" id="jump-trust">Verify trust below</a>
+            </div>
+          </article>
+
+          <aside class="panel certificate">
+            <p class="eyebrow">IDENTITY METADATA</p>
+            <h3 id="ca-name">Loading certificate…</h3>
+            <dl class="kv-dl">
+              <dt>SHA-256 FINGERPRINT</dt>
+              <dd class="fingerprint" id="fingerprint">Querying gateway…</dd>
+              <dt>VALID UNTIL</dt>
+              <dd id="ca-expiry">—</dd>
+            </dl>
+            <p class="small">Cross-check this digest against the Cardputer terminal or trusted SSH output before trusting it in your OS keychain.</p>
+          </aside>
+        </div>
+
+        <section class="guides">
+          <details open><summary>Windows</summary><p>Open the downloaded certificate, choose <strong>Install Certificate</strong> → <strong>Current User</strong> → <strong>Place all certificates in the following store</strong> → <strong>Trusted Root Certification Authorities</strong>. Verify the name and SHA-256 fingerprint before confirming.</p><p>Removal: open <code>certmgr.msc</code>, locate this CA under Trusted Root Certification Authorities → Certificates, and delete only that entry.</p></details>
+          <details><summary>macOS</summary><p>Import the file into Keychain Access (login or System keychain), open the certificate entry, expand <strong>Trust</strong>, and set SSL to <strong>Always Trust</strong>.</p><p>Removal: locate this NetBridge CA in Keychain Access and delete it.</p></details>
+          <details><summary>iOS / iPadOS</summary><p>Download in Safari, install the profile under Settings → General → VPN &amp; Device Management, then enable full trust under Settings → General → About → Certificate Trust Settings. <a href="https://support.apple.com/en-us/102390" target="_blank" rel="noreferrer">Apple documentation</a>.</p></details>
+          <details><summary>Android</summary><p>Install via Settings → Security &amp; privacy → Encryption &amp; credentials → Install a certificate → CA certificate. Note that Android user CAs do not apply to apps targeting modern network security configs without app modification. <a href="https://support.google.com/pixelphone/answer/2844832?hl=en" target="_blank" rel="noreferrer">Android documentation</a>.</p></details>
+          <details><summary>Linux &amp; Firefox</summary><p>Debian/Ubuntu: copy as <code>.crt</code> into <code>/usr/local/share/ca-certificates/</code> and run <code>sudo update-ca-certificates</code>. For Firefox, import under Settings → Privacy &amp; Security → Certificates → View Certificates → Authorities. <a href="https://support.mozilla.org/en-US/kb/setting-certificate-authorities-firefox" target="_blank" rel="noreferrer">Mozilla documentation</a>.</p></details>
+        </section>
+      </section>
+
+      <section class="page-section" id="trust-section">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="section-heading__label">02</p>
+            <h2 class="section-heading__title">Browser Trust Verification</h2>
+          </div>
+          <p class="section-heading__utility">$ curl --cacert NetBridge-CA.crt https://192.168.50.1/api/trust-probe</p>
+        </div>
+
+        <article class="panel">
+          <div id="trust-http-prompt" hidden>
+            <p class="eyebrow">TLS PROBE REQUIRED</p>
+            <h3>Switch to HTTPS to test your installed CA</h3>
+            <p>This check must load over <code>https://</code> so your browser validates the gateway certificate chain. If a warning appears, return to Step 01 and verify the CA store installation rather than clicking through a warning.</p>
+            <a class="button primary" id="launch-https-trust" href="https://192.168.50.1/#trust-section">Run HTTPS trust check --&gt;</a>
+          </div>
+          <div id="trust-https-box" hidden>
+            <p class="eyebrow">HTTPS HANDSHAKE VERIFIED</p>
+            <h3 id="trust-title">Checking TLS session…</h3>
+            <p id="trust-copy">Connect this client to the NetBridge Wi-Fi network first.</p>
+            <form id="trust-form" hidden>
+              <label class="check"><input type="checkbox" id="no-warning" required><span>I installed the NetBridge CA and loaded this HTTPS page cleanly without bypassing a certificate warning.</span></label>
+              <button class="primary" type="submit">Confirm browser trust</button>
+            </form>
+            <p class="small note-muted">Trust confirmation applies per Wi-Fi association and resets automatically when this device disconnects.</p>
+          </div>
+        </article>
+      </section>
+    </section>
+
+    <section id="authentication" hidden>
+      <header class="section-page-header">
+        <p class="entry-marker">Restricted Access</p>
+        <h1 class="article-title" id="auth-title">Operator Sign In</h1>
+        <p class="article-dek" id="auth-copy">Authenticate with the NetBridge administrator password.</p>
+      </header>
+      <article class="panel narrow">
+        <form id="auth-form">
+          <div id="pair-field" hidden>
+            <label for="pair-code">One-time pairing code</label>
+            <input id="pair-code" autocomplete="off" maxlength="64">
+            <p class="small">Shown on the Cardputer screen before initial pairing. Expires after 15 minutes.</p>
+          </div>
+          <label for="admin-password">Administrator password</label>
+          <input id="admin-password" type="password" autocomplete="current-password" minlength="12" maxlength="128" required>
+          <button class="primary" id="auth-submit" type="submit">Sign in</button>
+        </form>
+      </article>
+    </section>
+
+    <section id="admin" hidden>
+      <header class="section-page-header admin-header-bar">
+        <div>
+          <p class="entry-marker">Gateway Administration</p>
+          <h1 class="article-title">Node Telemetry &amp; Access Control</h1>
+          <p class="article-dek">Authorize test clients, toggle transparent capture, and manage device credentials.</p>
+        </div>
+        <div class="action-row">
+          <a class="button primary" href="/inspector" id="open-inspector-btn">Open Traffic Inspector --&gt;</a>
+          <button class="quiet" id="admin-refresh" type="button">Refresh</button>
+          <button class="quiet" id="admin-logout" type="button">Sign out</button>
+        </div>
+      </header>
+
+      <section class="page-section">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="section-heading__label">01</p>
+            <h2 class="section-heading__title">Telemetry &amp; Inspection Switch</h2>
+          </div>
+          <p class="section-heading__utility">$ systemctl status netbridge-proxy</p>
+        </div>
+
+        <div class="metrics">
+          <article><span>ETHERNET WAN</span><strong id="wan-state">Checking</strong></article>
+          <article><span>CONNECTED CLIENTS</span><strong id="client-count">0</strong></article>
+          <article><span>CAPTURE ENGINE</span><strong id="inspection-state">Off</strong></article>
+          <article><span>CAPTURED FLOWS</span><strong id="flow-count">0 / 80</strong></article>
+        </div>
+
+        <div class="panel control-strip">
+          <div>
+            <p class="eyebrow">TRANSPARENT PROXY CONTROL</p>
+            <h3 id="control-heading">Inspection is currently off</h3>
+            <p class="small">When enabled, approved and trust-confirmed devices have outbound TCP traffic (excluding DNS) redirected through <code>mitmdump</code>. If the proxy stops, redirection is flushed immediately.</p>
+          </div>
+          <div class="action-row">
+            <button class="primary" id="admin-toggle-inspection" type="button">Enable inspection</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="page-section">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="section-heading__label">02</p>
+            <h2 class="section-heading__title">Associated Test Devices</h2>
+          </div>
+          <p class="section-heading__utility">$ iw dev wlan0 station dump</p>
+        </div>
+        <div id="clients" class="clients"></div>
+      </section>
+
+      <section class="page-section">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="section-heading__label">03</p>
+            <h2 class="section-heading__title">Gateway Configuration</h2>
+          </div>
+          <p class="section-heading__utility">$ cat /etc/netbridge/phase1.toml</p>
+        </div>
+        <div class="split">
+          <article class="panel">
+            <h3>Wi-Fi Access Point</h3>
+            <p class="small">Saving restarts the AP and drops active wireless clients.</p>
+            <form id="wifi-form">
+              <label for="ssid">Network SSID</label>
+              <input id="ssid" maxlength="32" required>
+              <label for="wifi-password">New Wi-Fi password</label>
+              <input id="wifi-password" type="password" minlength="8" maxlength="63" autocomplete="new-password" required>
+              <button type="submit">Save Wi-Fi settings</button>
+            </form>
+          </article>
+          <article class="panel">
+            <h3>Administrator Password</h3>
+            <p class="small">Minimum 12 characters. Rotating signs out active sessions.</p>
+            <form id="password-form">
+              <label for="new-password">New administrator password</label>
+              <input id="new-password" type="password" minlength="12" maxlength="128" autocomplete="new-password" required>
+              <button type="submit">Change administrator password</button>
+            </form>
+          </article>
+        </div>
+      </section>
+
+      <section class="page-section">
+        <div class="section-heading section-heading--split">
+          <div>
+            <p class="section-heading__label">04</p>
+            <h2 class="section-heading__title">Certificate Lifecycle</h2>
+          </div>
+          <p class="section-heading__utility">$ netbridge-portal rotate</p>
+        </div>
+        <article class="panel danger">
+          <div>
+            <p class="eyebrow">DESTRUCTIVE OPERATION</p>
+            <h3>Rotate Root Certificate Authority</h3>
+            <p>Replaces the persistent CA identity, clears all device trust/sessions, and purges captured flows. All test devices must install the new CA from Device Setup.</p>
+          </div>
+          <form id="rotate-form">
+            <label for="rotate-confirm">Type ROTATE to confirm</label>
+            <input id="rotate-confirm" placeholder="ROTATE" autocomplete="off" required>
+            <button type="submit" class="danger-button">Rotate CA</button>
+          </form>
+        </article>
+      </section>
+    </section>
+
+    <section id="inspector" hidden>
+      <div class="inspector-top">
+        <div>
+          <p class="entry-marker">Live Traffic Telemetry // mitmdump transparent</p>
+          <h1 class="inspector-h1">Traffic &amp; Application Inspector</h1>
+          <p class="heartbeat-bar">
+            <span>STATUS // <strong id="hb-state">OFF</strong></span>
+            <span>RING // <strong id="hb-flows">0 / 80</strong></span>
+            <span>LAST EVENT // <strong id="hb-last-event">None yet</strong></span>
+            <span>LAST POLL // <strong id="hb-last-poll">—</strong></span>
+          </p>
+        </div>
+        <div class="inspection-controls">
+          <button class="primary" id="inspector-toggle-inspection" type="button">Enable inspection</button>
+          <button class="quiet" id="pause-flows" type="button">Pause</button>
+          <a class="button quiet" id="export-jsonl" href="/api/flows-export?format=jsonl">JSONL</a>
+          <a class="button quiet" id="export-har" href="/api/flows-export?format=har">HAR</a>
+          <a class="button quiet" id="export-csv" href="/api/flows-export?format=csv">CSV</a>
+          <button class="quiet" id="clear-flows" type="button">Clear</button>
+          <button class="quiet" id="inspector-logout" type="button">Sign out</button>
+        </div>
+      </div>
+
+      <div class="flow-filters">
+        <select id="filter-client" aria-label="Filter by client"><option value="">All clients</option></select>
+        <input id="filter-host" type="search" placeholder="Filter host, path, IP, port, method, or MIME…" aria-label="Filter flows">
+        <select id="filter-state" aria-label="Filter by protocol or type">
+          <option value="">All traffic</option>
+          <option value="http">HTTP / HTTPS</option>
+          <option value="tcp">Raw TCP / App C2</option>
+          <option value="websocket">WebSockets</option>
+          <option value="images">Images &amp; media</option>
+          <option value="json">JSON / API</option>
+          <option value="errors">TLS / flow errors</option>
+          <option value="http45">HTTP 4xx / 5xx</option>
+        </select>
+      </div>
+
+      <div class="inspector-split">
+        <div class="flow-table-wrap">
+          <div class="flow-table-head">
+            <span>Time</span><span>Proto</span><span>Path / Destination</span><span>Method</span><span>Status</span><span>Size</span><span>Lat</span>
+          </div>
+          <div id="flows" class="flows"></div>
+        </div>
+
+        <aside id="flow-inspector" class="flow-inspector" aria-live="polite">
+          <div id="inspector-empty" class="inspector-empty">Select any flow row to inspect full headers, request/response bodies, inline images, canonical hex dumps, and TLS/certificate metadata.</div>
+          <div id="inspector-content" hidden>
+            <div class="inspector-head">
+              <div class="inspector-title-wrap"><strong id="inspector-title">—</strong><span id="inspector-subtitle" class="small"></span></div>
+              <button id="inspector-close" class="quiet compact" type="button" aria-label="Close inspector">×</button>
+            </div>
+            <div class="inspector-tabs" role="tablist">
+              <button type="button" class="tab active" data-tab="request">Request</button>
+              <button type="button" class="tab" data-tab="response">Response</button>
+              <button type="button" class="tab" data-tab="details">Details</button>
+            </div>
+            <div id="inspector-body" class="inspector-body"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </div>
 </main>
-<footer><span>NetBridge · Cardputer Zero</span><span>Local setup · Authorized testing only</span></footer>
-</body></html>
+
+<footer class="site-footer">
+  <div class="site-shell site-footer__inner">
+    <p>NetBridge is a local authorized-test Wi-Fi gateway and traffic inspection node running on Cardputer Zero.</p>
+    <div class="site-footer__links">
+      <a href="/">Setup</a>
+      <a href="/admin" id="footer-admin">Admin</a>
+      <a href="/inspector" id="footer-inspector">Inspector</a>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

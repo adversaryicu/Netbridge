@@ -62,6 +62,59 @@ def main():
             raise AssertionError('Host-service rejection rule was not exercised')
         print('PASS: AP access to host SSH hits firewall rejection', flush=True)
         print('PASS: repeated firewall replacement', flush=True)
+        # Verify transparent inspection redirect only affects @inspected_v4 and fails open on flush.
+        up_http = subprocess.Popen(
+            ['ip', 'netns', 'exec', upstream, 'python3', '-c',
+             "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('198.18.0.1', 80)); s.listen(4); "
+             "[c.sendall(b'UPSTREAM') or c.close() for c, _ in iter(s.accept, None)]"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        up_app = subprocess.Popen(
+            ['ip', 'netns', 'exec', upstream, 'python3', '-c',
+             "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('198.18.0.1', 4444)); s.listen(4); "
+             "[c.sendall(b'UPSTREAM_4444') or c.close() for c, _ in iter(s.accept, None)]"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        gw_proxy = subprocess.Popen(
+            ['ip', 'netns', 'exec', gateway, 'python3', '-c',
+             "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('0.0.0.0', 8080)); s.listen(4); "
+             "[c.sendall(b'PROXY') or c.close() for c, _ in iter(s.accept, None)]"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        gw_portal = subprocess.Popen(
+            ['ip', 'netns', 'exec', gateway, 'python3', '-c',
+             "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('192.168.50.1', 80)); s.listen(4); "
+             "[c.sendall(b'PORTAL') or c.close() for c, _ in iter(s.accept, None)]"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            import time
+            time.sleep(0.3)
+            def probe(host, port):
+                return inside(client, 'python3', '-c',
+                              f"import socket; s=socket.socket(); s.settimeout(2); s.connect(('{host}', {port})); print(s.recv(32).decode())").stdout.strip()
+            assert probe('198.18.0.1', 80) == 'UPSTREAM', 'Uninspected client should bypass proxy'
+            assert probe('198.18.0.1', 4444) == 'UPSTREAM_4444', 'Uninspected client app port should bypass proxy'
+            inside(gateway, 'nft', 'add', 'element', 'inet', 'netbridge', 'inspected_v4', '{ 192.168.50.100 }')
+            assert probe('198.18.0.1', 80) == 'PROXY', 'Inspected client should redirect HTTP to :8080'
+            assert probe('198.18.0.1', 4444) == 'PROXY', 'Inspected client custom app TCP port should redirect to :8080'
+            assert probe('192.168.50.1', 80) == 'PORTAL', 'Gateway portal must not be redirected'
+            direct_8080 = inside(client, 'python3', '-c',
+                                 "import socket; s=socket.socket(); s.settimeout(1); print(s.connect_ex(('192.168.50.1', 8080)))").stdout.strip()
+            assert direct_8080 != '0', f'Direct client connection to :8080 should be rejected, got {direct_8080}'
+            quic_probe = inside(client, 'python3', '-c',
+                                "import socket, time\ns=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.settimeout(1)\n"
+                                "s.connect(('198.18.0.1', 443))\ns.send(b'quic')\ntime.sleep(0.1)\n"
+                                "try:\n s.recv(16)\n print('NONE')\nexcept Exception as e:\n print(type(e).__name__)").stdout.strip()
+            assert quic_probe == 'ConnectionRefusedError', f'QUIC UDP/443 should be rejected for inspected client, got {quic_probe}'
+            inside(gateway, 'nft', 'flush', 'set', 'inet', 'netbridge', 'inspected_v4')
+            assert probe('198.18.0.1', 80) == 'UPSTREAM', 'Flushing inspected_v4 must fail open to upstream'
+            assert probe('198.18.0.1', 4444) == 'UPSTREAM_4444', 'Flushing inspected_v4 must fail open app port to upstream'
+            print('PASS: per-client HTTP + app-TCP redirect, portal exclusion, direct-8080 block, QUIC block, and fail-open flush', flush=True)
+        finally:
+            for proc in (up_http, up_app, gw_proxy, gw_portal):
+                proc.terminate()
+                proc.wait(timeout=5)
     finally:
         for ns in reversed(created):
             cmd('ip', 'netns', 'delete', ns, check=False)

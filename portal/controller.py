@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Privileged local controller. Only the dedicated portal UID can use its socket."""
 import asyncio
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import hashlib
 import hmac
 import importlib.util
@@ -14,6 +14,7 @@ from pathlib import Path
 import pwd
 import re
 import secrets
+import shutil
 import socket
 import struct
 import time
@@ -29,6 +30,11 @@ PUBLIC = BASE / 'portal-public'
 CA = BASE / 'ca'
 TLS = Path('/etc/netbridge/portal-tls')
 SOCKET = '/run/netbridge/control.sock'
+FLOWS_DIR = Path('/run/netbridge/flows')
+STAGE_DIR = Path('/run/netbridge/proxy-stage')
+MAX_FLOWS = 80
+MAX_FLOW_STORAGE_BYTES = 6 * 1024 * 1024
+SYS_NET = Path('/sys/class/net')
 
 
 class Failure(Exception):
@@ -37,16 +43,35 @@ class Failure(Exception):
 
 
 class Controller:
+    proxy_uid = None
+    inspection_enabled = False
+    proxy_healthy = False
+    _synced_inspected = ()
+    flow_seq = 0
+    flow_bytes = 0
+
     def __init__(self):
         self.config = tomllib.loads(Path('/etc/netbridge/phase1.toml').read_text())
         self.network = json.loads((BASE / 'phase1.json').read_text())
         self.gateway = str(ipaddress.ip_interface(self.config['lan']['cidr']).ip)
         self.portal_uid = pwd.getpwnam('netbridge-portal').pw_uid
         self.portal_gid = pwd.getpwnam('netbridge-portal').pw_gid
+        try:
+            self.proxy_uid = pwd.getpwnam('netbridge-proxy').pw_uid
+        except KeyError:
+            self.proxy_uid = None
         self.clients = {}
         self.sessions = OrderedDict()
         self.attempts = OrderedDict()
+        self.flows = deque()
+        self.flow_seq = 0
+        self.flow_bytes = 0
+        self.flow_sizes = {}
+        self.inspection_enabled = False
+        self.proxy_healthy = False
+        self._synced_inspected = ()
         self.operation = asyncio.Lock()
+        self.firewall_lock = asyncio.Lock()
         self.hash_gate = asyncio.Semaphore(1)
         self.pending = False
         self.health = 'starting'
@@ -148,6 +173,200 @@ class Controller:
             active[mac] = old
         self.clients = active
 
+    def inspection_state(self):
+        if not self.inspection_enabled:
+            return 'off'
+        return 'on' if self.proxy_healthy else 'degraded'
+
+    def desired_inspected_ips(self):
+        if not (self.inspection_enabled and self.proxy_healthy and self.health == 'ok'):
+            return ()
+        ips = []
+        for client in self.clients.values():
+            if client.get('approved') and client.get('trust_confirmed') and client.get('ip'):
+                try:
+                    ips.append(str(ipaddress.IPv4Address(client['ip'])))
+                except ValueError:
+                    pass
+        return tuple(sorted(set(ips)))
+
+    @staticmethod
+    def is_proxy_port_listening(port=8080):
+        suffix = f':{port:04X}'
+        for table in ('/proc/net/tcp', '/proc/net/tcp6'):
+            path = Path(table)
+            if not path.exists():
+                continue
+            for line in path.read_text().splitlines()[1:]:
+                cols = line.split()
+                if len(cols) >= 4 and cols[1].endswith(suffix) and cols[3] == '0A':
+                    return True
+        return False
+
+    async def check_proxy_health(self):
+        if not self.is_proxy_port_listening(8080):
+            return False
+        process = await asyncio.create_subprocess_exec(
+            'systemctl', 'is-active', 'netbridge-proxy.service',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            out, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return False
+        return process.returncode == 0 and out.decode().strip() == 'active'
+
+    async def apply_inspected_ips(self, ips):
+        script = 'flush set inet netbridge inspected_v4\n'
+        if ips:
+            elements = ', '.join(str(ipaddress.IPv4Address(ip)) for ip in ips)
+            script += f'add element inet netbridge inspected_v4 {{ {elements} }}\n'
+        process = await asyncio.create_subprocess_exec(
+            'nft', '-f', '-', stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            _, err = await asyncio.wait_for(process.communicate(script.encode()), timeout=10)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise Failure('Firewall update timed out', 503)
+        if process.returncode:
+            raise Failure('Firewall update failed; check diagnostics over Ethernet SSH', 503)
+
+    async def sync_inspection_firewall(self, force=False):
+        lock = getattr(self, 'firewall_lock', None)
+        if lock is None:
+            lock = self.firewall_lock = asyncio.Lock()
+        async with lock:
+            ips = self.desired_inspected_ips()
+            if not force and ips == self._synced_inspected:
+                return
+            await self.apply_inspected_ips(ips)
+            self._synced_inspected = ips
+
+    def setup_flow_dirs(self):
+        for directory in (FLOWS_DIR, STAGE_DIR):
+            directory.mkdir(parents=True, exist_ok=True)
+            for item in directory.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+        os.chmod(FLOWS_DIR, 0o750)
+        os.chown(FLOWS_DIR, 0, self.portal_gid)
+        os.chmod(STAGE_DIR, 0o750)
+        if self.proxy_uid is not None:
+            os.chown(STAGE_DIR, self.proxy_uid, 0)
+
+    def _delete_flow_files(self, flow_id):
+        sizes = getattr(self, 'flow_sizes', None)
+        if sizes is not None:
+            self.flow_bytes = max(0, getattr(self, 'flow_bytes', 0) - sizes.pop(flow_id, 0))
+        for suffix in ('.json', '.req', '.resp'):
+            (FLOWS_DIR / f'{flow_id}{suffix}').unlink(missing_ok=True)
+
+    def clear_flow_files(self):
+        if hasattr(self, 'flows'):
+            self.flows.clear()
+        if hasattr(self, 'flow_sizes'):
+            self.flow_sizes.clear()
+        self.flow_bytes = 0
+        for directory in (FLOWS_DIR, STAGE_DIR):
+            if directory.exists():
+                for item in directory.iterdir():
+                    if item.is_file():
+                        item.unlink(missing_ok=True)
+
+    def _enforce_flow_quota(self):
+        while getattr(self, 'flow_bytes', 0) > MAX_FLOW_STORAGE_BYTES and len(self.flows) > 1:
+            oldest = self.flows.popleft()
+            self._delete_flow_files(oldest['id'])
+
+    def record_flow(self, raw, stage=None):
+        staged_meta = None
+        if stage is not None:
+            if not isinstance(stage, str) or not re.fullmatch(r'[0-9a-f]{32}', stage):
+                raise Failure('Invalid flow stage token')
+            staged_meta = STAGE_DIR / f'stage-{stage}.json'
+            if not staged_meta.is_file():
+                raise Failure('Missing staged flow payload', 404)
+            raw = json.loads(staged_meta.read_text())
+        if not isinstance(raw, dict):
+            raise Failure('Invalid flow payload')
+        if not hasattr(self, 'flows'):
+            self.flows = deque()
+        if not hasattr(self, 'flow_sizes'):
+            self.flow_sizes = {}
+        try:
+            self.flow_seq += 1
+            flow_id = self.flow_seq
+            state = str(raw.get('state', 'error'))
+            if state not in ('decrypted', 'passthrough', 'websocket', 'tcp', 'tls_failed', 'error'):
+                state = 'error'
+            try:
+                status = max(0, min(999, int(raw.get('status', 0))))
+            except (TypeError, ValueError):
+                status = 0
+            try:
+                byte_count = max(0, int(raw.get('bytes', 0)))
+            except (TypeError, ValueError):
+                byte_count = 0
+            try:
+                req_bytes = max(0, int(raw.get('req_bytes', 0)))
+            except (TypeError, ValueError):
+                req_bytes = 0
+            try:
+                duration_ms = max(0, int(raw.get('duration_ms', 0)))
+            except (TypeError, ValueError):
+                duration_ms = 0
+            try:
+                server_port = max(0, min(65535, int(raw.get('server_port', 0))))
+            except (TypeError, ValueError):
+                server_port = 0
+            summary = {
+                'id': flow_id,
+                'time': str(raw.get('time', ''))[:32],
+                'client_ip': str(raw.get('client_ip', ''))[:45],
+                'server_ip': str(raw.get('server_ip', ''))[:45],
+                'server_port': server_port,
+                'method': str(raw.get('method', 'GET'))[:16],
+                'scheme': str(raw.get('scheme', 'http'))[:16],
+                'host': str(raw.get('host', ''))[:128],
+                'path': str(raw.get('path', '/'))[:120],
+                'status': status,
+                'reason': str(raw.get('reason', ''))[:64],
+                'content_type': str(raw.get('content_type', ''))[:48],
+                'req_bytes': req_bytes,
+                'bytes': byte_count,
+                'duration_ms': duration_ms,
+                'state': state,
+                'detail': str(raw.get('detail', ''))[:120],
+            }
+            if FLOWS_DIR.is_dir():
+                portal_gid = getattr(self, 'portal_gid', None)
+                meta_dest = FLOWS_DIR / f'{flow_id}.json'
+                if staged_meta is not None and staged_meta.is_file():
+                    os.replace(staged_meta, meta_dest)
+                else:
+                    meta = dict(raw)
+                    meta['id'] = flow_id
+                    meta_dest.write_text(json.dumps(meta))
+                os.chmod(meta_dest, 0o640)
+                if portal_gid is not None:
+                    os.chown(meta_dest, 0, portal_gid)
+                disk_bytes = meta_dest.stat().st_size
+                self.flow_sizes[flow_id] = disk_bytes
+                self.flow_bytes = getattr(self, 'flow_bytes', 0) + disk_bytes
+            while len(self.flows) >= MAX_FLOWS:
+                oldest = self.flows.popleft()
+                self._delete_flow_files(oldest['id'])
+            self.flows.append(summary)
+            self._enforce_flow_quota()
+        finally:
+            if staged_meta is not None:
+                staged_meta.unlink(missing_ok=True)
+
     async def monitor(self):
         while True:
             try:
@@ -175,6 +394,27 @@ class Controller:
             except Exception:
                 self.clients.clear()
                 self.health = 'unavailable'
+            try:
+                await self.sync_inspection_firewall()
+            except Exception:
+                self.audit_event('firewall_sync_failed')
+            await asyncio.sleep(2)
+
+    async def proxy_monitor(self):
+        while True:
+            try:
+                if self.inspection_enabled:
+                    healthy = await self.check_proxy_health()
+                    if healthy != self.proxy_healthy:
+                        self.proxy_healthy = healthy
+                        self.audit_event('proxy_healthy' if healthy else 'proxy_unhealthy_fail_open')
+                        await self.sync_inspection_firewall(force=True)
+                elif self.proxy_healthy or self._synced_inspected:
+                    self.proxy_healthy = False
+                    await self.sync_inspection_firewall(force=True)
+            except Exception:
+                self.proxy_healthy = False
+                self.audit_event('proxy_monitor_failed')
             await asyncio.sleep(2)
 
     async def station_events(self):
@@ -190,14 +430,26 @@ class Controller:
                         continue
                     match = re.search(r'del station\s+([0-9a-f:]{17})', text, re.I)
                     if match:
-                        self.clients.pop(match[1].lower(), None)
+                        if self.clients.pop(match[1].lower(), None) is not None:
+                            try:
+                                await self.sync_inspection_firewall()
+                            except Exception:
+                                pass
                     elif 'disconnected' in text.lower():
                         self.clients.clear()
+                        try:
+                            await self.sync_inspection_firewall()
+                        except Exception:
+                            pass
             finally:
                 if process.returncode is None:
                     process.terminate()
                 await process.wait()
                 self.clients.clear()
+                try:
+                    await self.sync_inspection_firewall()
+                except Exception:
+                    pass
             await asyncio.sleep(5)
 
     async def delayed(self, task):
@@ -215,10 +467,16 @@ class Controller:
         data = request.get('data') or {}
         if not isinstance(data, dict):
             raise Failure('Invalid request')
+        if action == 'flow-event':
+            peer_uid = request.get('_peer_uid')
+            if peer_uid is None or (peer_uid != 0 and peer_uid != self.proxy_uid):
+                raise Failure('Forbidden', 403)
+            self.record_flow(request.get('event') if 'event' in request else data, stage=request.get('stage'))
+            return {'ok': True}
         ip = str(ipaddress.ip_address(request.get('ip', '0.0.0.0')))
         if action == 'public':
             return {'ca': json.loads((PUBLIC / 'ca.json').read_text()), 'paired': ADMIN.exists(),
-                    'gateway': self.gateway, 'inspection': 'off'}
+                    'gateway': self.gateway, 'inspection': self.inspection_state()}
         if action == 'downloaded':
             try:
                 self.current_client(ip)['downloaded'] = True
@@ -266,13 +524,17 @@ class Controller:
                         raise Failure('Incorrect administrator password', 401)
                     self.audit_event('login_success')
             return self.new_session()
-        record = self.authorize(request, mutate=action != 'status')
+        record = self.authorize(request, mutate=action not in ('status', 'flow-index'))
+        if action == 'flow-index':
+            return {'ok': True, 'ids': [f['id'] for f in self.flows] if hasattr(self, 'flows') else []}
         if action == 'status':
             clients = [{k: v for k, v in c.items() if k in ('mac', 'ip', 'name', 'downloaded', 'trust_confirmed', 'approved')}
                        for c in self.clients.values()]
-            wan = Path('/sys/class/net') / self.network['wan'] / 'carrier'
+            wan = SYS_NET / self.network['wan'] / 'carrier'
+            flows = list(reversed(self.flows)) if hasattr(self, 'flows') else []
             return {'csrf': record['csrf'], 'clients': clients, 'monitor': self.health,
-                    'wan_connected': wan.read_text().strip() == '1', 'inspection': 'off',
+                    'wan_connected': wan.read_text().strip() == '1', 'inspection': self.inspection_state(),
+                    'inspected_clients': len(self.desired_inspected_ips()), 'flows': flows,
                     'ssid': self.config['ap']['ssid'], 'ca': json.loads((PUBLIC / 'ca.json').read_text()),
                     'pending': self.pending}
         if action == 'logout':
@@ -285,8 +547,48 @@ class Controller:
             if action == 'approve' and not client['trust_confirmed']:
                 raise Failure('This client must complete and confirm the HTTPS trust test first', 409)
             client['approved'] = action == 'approve'
+            await self.sync_inspection_firewall()
             self.audit_event('client_' + action)
-            return {'ok': True, 'inspection': 'off'}
+            return {'ok': True, 'inspection': self.inspection_state()}
+        if action == 'flows-clear':
+            self.clear_flow_files()
+            self.audit_event('flows_cleared')
+            return {'ok': True}
+        if action == 'inspection':
+            enabled = data.get('enabled')
+            if type(enabled) is not bool:
+                raise Failure('Invalid inspection request')
+            lock = getattr(self, 'operation', None)
+            if lock is None:
+                lock = self.operation = asyncio.Lock()
+            async with lock:
+                if enabled:
+                    await self.command('systemctl', 'start', 'netbridge-proxy.service')
+                    deadline = time.monotonic() + 15
+                    healthy = False
+                    while time.monotonic() < deadline:
+                        if await self.check_proxy_health():
+                            healthy = True
+                            break
+                        await asyncio.sleep(0.25)
+                    if not healthy:
+                        await asyncio.create_subprocess_exec('systemctl', 'stop', 'netbridge-proxy.service')
+                        self.inspection_enabled = False
+                        self.proxy_healthy = False
+                        await self.sync_inspection_firewall(force=True)
+                        self.audit_event('inspection_start_failed')
+                        raise Failure('Inspection proxy failed to become ready; direct routing remains active', 503)
+                    self.inspection_enabled = True
+                    self.proxy_healthy = True
+                    await self.sync_inspection_firewall(force=True)
+                    self.audit_event('inspection_enabled')
+                else:
+                    self.inspection_enabled = False
+                    self.proxy_healthy = False
+                    await self.sync_inspection_firewall(force=True)
+                    await self.command('systemctl', 'stop', 'netbridge-proxy.service')
+                    self.audit_event('inspection_disabled')
+            return {'ok': True, 'inspection': self.inspection_state()}
         if action == 'admin-password':
             async with self.hash_gate:
                 new = await self.password_work('hash', data.get('password'))
@@ -301,9 +603,15 @@ class Controller:
                 raise Failure('Type ROTATE to confirm CA replacement')
             async def rotate():
                 async with self.operation:
+                    self.inspection_enabled = False
+                    self.proxy_healthy = False
+                    await self.sync_inspection_firewall(force=True)
+                    proc = await asyncio.create_subprocess_exec('systemctl', 'stop', 'netbridge-proxy.service')
+                    await proc.wait()
                     await self.command('/usr/bin/python3', str(Path(__file__).with_name('certificate_worker.py')), 'rotate')
                     self.clients.clear()
                     self.sessions.clear()
+                    self.clear_flow_files()
                     self.audit_event('ca_rotated')
                     await self.command('systemctl', 'restart', 'netbridge-portal')
             self.pending = True
@@ -332,6 +640,7 @@ class Controller:
                         await self.command('systemctl', 'restart', 'netbridge-ap')
                         self.config = config
                         self.clients.clear()
+                        await self.sync_inspection_firewall(force=True)
                         self.audit_event('ap_settings_changed')
                     except Exception:
                         module.atomic_write(module.CONFIG, old_config)
@@ -349,10 +658,18 @@ class Controller:
         try:
             credentials = writer.get_extra_info('socket').getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
             _, uid, _ = struct.unpack('3i', credentials)
-            if uid not in (0, self.portal_uid):
+            allowed = {0, self.portal_uid}
+            if self.proxy_uid is not None:
+                allowed.add(self.proxy_uid)
+            if uid not in allowed:
                 raise Failure('Forbidden', 403)
             raw = await asyncio.wait_for(reader.readline(), timeout=5)
             request = json.loads(raw)
+            if not isinstance(request, dict):
+                raise Failure('Invalid request')
+            if uid == self.proxy_uid and request.get('action') != 'flow-event':
+                raise Failure('Forbidden', 403)
+            request['_peer_uid'] = uid
             result = await self.dispatch(request)
             response = {'status': 200, 'data': result}
         except Failure as error:
@@ -372,12 +689,14 @@ class Controller:
 
 async def main():
     controller = Controller()
+    controller.setup_flow_dirs()
     await controller.command('/usr/bin/python3', str(Path(__file__).with_name('certificate_worker.py')), 'prepare')
     Path(SOCKET).unlink(missing_ok=True)
     server = await asyncio.start_unix_server(controller.handle, path=SOCKET, limit=8192)
     os.chown(SOCKET, 0, controller.portal_gid)
-    os.chmod(SOCKET, 0o660)
+    os.chmod(SOCKET, 0o666 if controller.proxy_uid is not None else 0o660)
     asyncio.create_task(controller.monitor())
+    asyncio.create_task(controller.proxy_monitor())
     asyncio.create_task(controller.station_events())
     async with server:
         await server.serve_forever()

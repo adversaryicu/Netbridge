@@ -38,8 +38,12 @@ security and maintenance work. Preserve mitmdump as the only inspection engine.
 - Review renewal/exit races and recovery if power loss interrupts startup/cleanup.
 - Add complete uninstall/update handling with explicit identity-retention choices.
   Avoid overwriting changed configuration with source defaults during updates.
-- Package a repeatable ARM64 .deb with dependencies and precompiled watchdog;
-  test on a fresh Cardputer image without removing existing services.
+- Package the program into a distributable ARM64 `.deb` file for publication
+  to the **Cardputer Store**, including dependencies, precompiled native
+  watchdog (`netbridge-lease`), APPLaunch desktop/icon integration, and
+  maintainer scripts for clean install/upgrade/uninstall without overwriting
+  existing device config or identity; test on a fresh Cardputer image without
+  removing existing services.
 
 Acceptance: existing desktop/launcher/network profiles retained; app off at boot;
 known failures recover predictably; repeatable fresh install and update.

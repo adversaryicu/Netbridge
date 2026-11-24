@@ -50,7 +50,7 @@ def restored(previous):
         time.sleep(1)
     else:
         raise AssertionError('Session cleanup or Wi-Fi restoration failed')
-    for unit in ('netbridge-ap', 'netbridge-controller', 'netbridge-portal', 'netbridge-certificate-renew.timer'):
+    for unit in ('netbridge-ap', 'netbridge-controller', 'netbridge-portal', 'netbridge-proxy', 'netbridge-certificate-renew.timer'):
         assert command('systemctl', 'is-active', unit) != 'active', unit
         assert command('systemctl', 'is-enabled', unit) != 'enabled', unit
     print('All NetBridge units stopped; previous Wi-Fi restored; boot startup disabled', flush=True)
