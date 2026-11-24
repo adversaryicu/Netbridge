@@ -1,12 +1,13 @@
 # Next session plan
 
-Baseline: 2026-11-23. Next priority: **continuous live WebSocket frame tracking**
-(`websocket_start` and `websocket_message` hooks in `portal/proxy_addon.py` so
-long-lived open WebSockets, such as desktop app chat streams, appear immediately
-and stream frames live in `/inspector` instead of waiting for `websocket_end`).
+Baseline: 2026-11-24. NetBridge is a portable Wi-Fi **Network Tap** for the M5Stack Cardputer Zero, built to give operators full, unredacted visibility into the traffic of the devices and software they use.
 
-These are future tasks, not claims of completed functionality or authorization
-to deploy unreviewed interception.
+Next priorities:
+1. **Full unredacted logging** (remove remaining query-parameter redaction in `portal/proxy_addon.py` so all logged URLs, headers, cookies, tokens, and payloads are visible in full).
+2. **Plain-text export warning & confirmation** in `/inspector` before downloading `JSONL`, `HAR`, or `CSV` exports.
+3. **Continuous live WebSocket frame tracking** (`websocket_start` and `websocket_message` hooks in `portal/proxy_addon.py` so long-lived open WebSockets appear immediately and stream frames live in `/inspector` instead of waiting for `websocket_end`).
+
+These are future tasks, not claims of completed functionality or authorization to deploy unreviewed interception.
 
 ## 1. Establish the complete memory baseline
 
@@ -52,55 +53,69 @@ security and maintenance work. Preserve mitmdump as the only inspection engine.
 Acceptance: existing desktop/launcher/network profiles retained; app off at boot;
 known failures recover predictably; repeatable fresh install and update.
 
-## 3. Determine mitmdump feasibility, then integrate conservatively
+## 3. Harden transparent mitmdump tap integration
 
-Recheck current ARM64 package/version availability and supported transparent
-options on the actual device. Initial APT lists had no candidate and mitmdump
-was absent. Do not assume a package source, pin guessed versions, or invent flags.
-Profile a minimal instance before choosing limits; this kernel lacks memory
-cgroup enforcement, so the spec's provisional MemoryMax values are not protection.
+Transparent `mitmdump` integration (`netbridge-proxy.service` on `:8080`),
+selected-client IPv4 TCP redirection, UDP/443 QUIC rejection for inspected
+clients, and `/inspector` are implemented. Remaining hardening and verification:
 
-Implement isolated process lifecycle and health detection first. Only then add
-atomic, selected-client IPv4 TCP/80 and TCP/443 redirection with original
-destination preservation, explicit opt-in and trusted/approved test clients.
-Exclude the local portal, DNS, upstream management and proxy-originated traffic.
-Remove redirects immediately on proxy failure; leaving a restart policy alone
-is insufficient. Native app lease supervision does not already provide this.
+- Validate proxy crash, hang, and OOM scenarios on-device to confirm redirects are
+  removed immediately and direct pass-through connectivity is restored without
+  requiring client reconfiguration.
+- Document measured `mitmdump` memory/CPU behavior under sustained multi-client
+  traffic (noting that this kernel lacks memory cgroup enforcement, so unit
+  `MemoryMax` values are not hard protection).
+- Keep documentation explicit that pinning, app-specific CA policies, VPN
+  tunnels, ECH, and QUIC (when not falling back to TCP/TLS) remain inherent
+  visibility limits.
 
-Acceptance: an explicitly authorized browser request is observed accurately;
-inspection starts off; passthrough works without proxy; proxy crash/hang/OOM
-removes redirects and restores connectivity without requiring client settings.
-Do not claim QUIC, pinned apps, VPN tunnels or all mobile app HTTPS is decrypted.
+Acceptance: explicitly authorized browser/device requests are observed
+accurately; inspection starts off; pass-through works without proxy; proxy
+crash/hang/OOM removes redirects and restores connectivity cleanly.
 
-## 4. Metadata, filtering and compact monitoring
+## 4. Full-visibility inspection, filtering and live monitoring
 
-Add a bounded 100-event metadata ring and bounded transport from the mitmdump
-addon. Redact sensitive headers/query fields by default; no bodies by default.
-Track pass-through, blocked, failed and decrypted states distinctly. Implement
-client/domain/status filters with documented precedence and pre/post-decryption
-semantics. Add compact display status (WAN, clients, inspection, errors, resource
-usage) and browser live flows. Avoid unbounded per-flow objects or duplicate bodies.
-
+- **Remove query-parameter redaction**: remove `SENSITIVE_KEYS` / `redact_path`
+  redaction in `portal/proxy_addon.py` so all logged traffic—including full
+  URLs, query parameters, headers, cookies, tokens, and request/response
+  bodies—is captured and displayed in `/inspector` with nothing hidden or
+  redacted from the operator.
 - **Continuous live WebSocket frame tracking**: hook `websocket_start` and
   `websocket_message` in `portal/proxy_addon.py` (in addition to
   `websocket_end`) so long-lived open WebSocket connections (e.g. desktop app
   chat streams) appear immediately in `/inspector` and continuously stream/append
   incoming and outgoing frames and payloads in real time while the socket stays
-  open, within bounded per-flow and ring limits.
+  open, within bounded per-flow (`80`-flow / `6 MiB`) and buffer limits.
+- Track pass-through, blocked, failed, and decrypted states distinctly.
+- Formalize client/domain/status filter precedence and pre/post-decryption
+  semantics.
+- Add compact on-device display status (WAN, clients, inspection, errors,
+  resource usage).
 
-Acceptance: load cannot grow queues/history indefinitely; unsupported TLS and
-trust failures remain visible as failures; UI works when inspection is off.
+Acceptance: full unredacted traffic is visible to the authenticated operator;
+load cannot grow queues/history indefinitely; unsupported TLS and trust failures
+remain visible as failures; UI works cleanly when inspection is off.
 
 ## 5. Export and evidence handling
 
-Implement authenticated, disabled-by-default redacted JSONL/CSV exports, manifest
-and artifact hashes, UTC timestamps/timezone, applied filters, explicit quotas,
-retention and low-disk cutoff. Optional flow/packet exports come later. PCAP is
-packet data, not automatically decrypted HTTPS. Never export CA keys, Wi-Fi or
-administrator credentials, or unrelated host data. Add purge controls.
+- Keep `JSONL`, `HAR`, and `CSV` exports **unredacted** so exported logs match
+  the full traffic visible in `/inspector`.
+- **Plain-text export warning and confirmation**: add a confirmation prompt in
+  `/inspector` before downloading `JSONL`, `HAR`, or `CSV` exports that warns
+  the user plain-text exports can expose sensitive information (such as tokens,
+  cookies, or credentials) and asks them to confirm they want to export.
+- Add export manifests with artifact hashes, UTC timestamps/timezone, applied
+  filters, explicit quotas, retention limits, low-disk cutoff, and purge
+  controls.
+- Optional packet/PCAP exports come later (noting PCAP is link/packet data, not
+  automatically decrypted HTTPS).
+- Never export NetBridge's own CA private keys, Wi-Fi passphrase, administrator
+  credentials, or unrelated host data.
 
 Acceptance: size/time bounds and low-disk paths are tested; manifests describe
-actual capture scope; exports require authentication and deliberate operator action.
+actual capture scope; exports require authentication, deliberate operator
+confirmation of the plain-text sensitivity warning, and never leak device-local
+secrets.
 
 ## 6. Resilience and release readiness
 
@@ -109,6 +124,6 @@ CA expiry/rotation, SD write rate, disk-full, power interruption, proxy crashes,
 portal recovery and rate-limit abuse. Verify documented mobile/browser layouts.
 Record measured supported-client limits before claiming production readiness.
 
-The original DOCX definition of done also requires working inspection, filters,
-exports and failure recovery; the current gateway/onboarding milestone alone
-does not satisfy it.
+The original DOCX definition of done also requires full lifecycle validation,
+live WebSocket tracking, export quotas/warnings, and failure recovery before
+release readiness is claimed.
