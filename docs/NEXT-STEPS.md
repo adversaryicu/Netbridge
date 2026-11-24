@@ -1,8 +1,12 @@
 # Next session plan
 
-Baseline: 2026-11-21. Stop after documentation/icon work for today. These are
-future tasks, not claims of completed functionality or authorization to deploy
-unreviewed interception.
+Baseline: 2026-11-23. Next priority: **continuous live WebSocket frame tracking**
+(`websocket_start` and `websocket_message` hooks in `portal/proxy_addon.py` so
+long-lived open WebSockets, such as desktop app chat streams, appear immediately
+and stream frames live in `/inspector` instead of waiting for `websocket_end`).
+
+These are future tasks, not claims of completed functionality or authorization
+to deploy unreviewed interception.
 
 ## 1. Establish the complete memory baseline
 
@@ -76,6 +80,13 @@ Track pass-through, blocked, failed and decrypted states distinctly. Implement
 client/domain/status filters with documented precedence and pre/post-decryption
 semantics. Add compact display status (WAN, clients, inspection, errors, resource
 usage) and browser live flows. Avoid unbounded per-flow objects or duplicate bodies.
+
+- **Continuous live WebSocket frame tracking**: hook `websocket_start` and
+  `websocket_message` in `portal/proxy_addon.py` (in addition to
+  `websocket_end`) so long-lived open WebSocket connections (e.g. desktop app
+  chat streams) appear immediately in `/inspector` and continuously stream/append
+  incoming and outgoing frames and payloads in real time while the socket stays
+  open, within bounded per-flow and ring limits.
 
 Acceptance: load cannot grow queues/history indefinitely; unsupported TLS and
 trust failures remain visible as failures; UI works when inspection is off.
