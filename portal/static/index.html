@@ -313,5 +313,14 @@
     </div>
   </div>
 </footer>
+<dialog id="export-confirm-dialog" class="modal-dialog" aria-labelledby="export-confirm-title" aria-describedby="export-confirm-copy">
+  <p class="eyebrow">PLAIN-TEXT EXPORT WARNING</p>
+  <h3 id="export-confirm-title">Export unredacted logs?</h3>
+  <p id="export-confirm-copy" class="small">NetBridge logs are unredacted plain text. Exporting can expose sensitive information such as authentication tokens, session cookies, API keys, passwords, or private payloads. Confirm that you want to download this file.</p>
+  <div class="modal-actions">
+    <button class="quiet" id="export-confirm-cancel" type="button">Cancel</button>
+    <button class="danger-button" id="export-confirm-proceed" type="button">Confirm Export</button>
+  </div>
+</dialog>
 </body>
 </html>

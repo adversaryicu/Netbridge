@@ -13,7 +13,7 @@ The goal of NetBridge is **full, unredacted visibility** into client traffic. On
 ## Inspection philosophy
 
 - **Full visibility, no redaction**: NetBridge is built to help you see everything your devices and applications actually send over the wire. Logged traffic is intended to be inspected in full without hiding headers, query parameters, cookies, tokens, or payloads.
-- **Plain-text export warning**: Because captured logs are unredacted, exporting them (`JSONL`, `HAR`, or `CSV`) produces plain-text files that can expose sensitive data such as session tokens, cookies, or credentials. Exports require authentication and will present a warning asking you to confirm before downloading.
+- **Plain-text export warning**: Because captured logs are unredacted, exporting them (`JSONL`, `HAR`, or `CSV`) produces plain-text files that can expose sensitive data such as session tokens, cookies, or credentials. Exports require authentication, present a warning, and require confirmation before downloading.
 
 ## Features
 
@@ -123,9 +123,6 @@ profiling (including AP/launcher/lease processes) remains on the roadmap.
 Current gaps and upcoming work:
 - **Full unredacted logging**: remove the remaining query-parameter redaction in
   `portal/proxy_addon.py` so all logged URLs and parameters appear in full.
-- **Plain-text export confirmation**: add an explicit warning and confirmation
-  prompt in `/inspector` before downloading `JSONL`, `HAR`, or `CSV` exports,
-  noting that plain-text logs can expose sensitive tokens or cookies.
 - **Continuous live WebSocket frame tracking**: stream frames in real time while
   sockets remain open (`websocket_start` / `websocket_message`), in addition to
   `websocket_end` capture.

@@ -5,6 +5,7 @@ let inspectionState = 'off', lastFlows = [], lastClients = [];
 let selectedFlowId = null, selectedDetail = null, activeTab = 'response';
 let viewMode = { request: 'auto', response: 'auto' };
 let flowsPaused = false, pollBusy = false;
+let pendingExportUrl = null;
 const secure = location.protocol === 'https:';
 const httpsBase = `https://${location.hostname}`;
 const path = location.pathname;
@@ -259,9 +260,17 @@ function renderMessageTab(part) {
     const dlRaw = document.createElement('a'); dlRaw.className = 'mode-btn link';
     dlRaw.href = `/api/flow-raw?id=${encodeURIComponent(f.id)}&part=${part}&format=raw&download=1`;
     dlRaw.textContent = 'Download Raw';
+    dlRaw.addEventListener('click', event => {
+      event.preventDefault();
+      requestExportConfirmation(dlRaw.href, 'Raw Payload');
+    });
     const dlHex = document.createElement('a'); dlHex.className = 'mode-btn link';
     dlHex.href = `/api/flow-raw?id=${encodeURIComponent(f.id)}&part=${part}&format=hex&download=1`;
     dlHex.textContent = 'Export Hex';
+    dlHex.addEventListener('click', event => {
+      event.preventDefault();
+      requestExportConfirmation(dlHex.href, 'Hex Dump');
+    });
     actions.append(dlRaw, dlHex);
   }
   bar.append(modes, actions);
@@ -608,8 +617,63 @@ busy($('rotate-form'), async () => {
   setTimeout(() => { location.href = `http://${location.hostname}/`; }, 5000);
 });
 
+function triggerExportDownload(url) {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = '';
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+function requestExportConfirmation(url, label) {
+  const dialog = $('export-confirm-dialog');
+  if (!dialog || typeof dialog.showModal !== 'function') {
+    if (confirm(`Plain-text export warning: ${label} exports are unredacted and can expose sensitive information such as tokens, cookies, or credentials. Continue?`)) {
+      triggerExportDownload(url);
+    }
+    return;
+  }
+  pendingExportUrl = url;
+  $('export-confirm-title').textContent = `Export unredacted ${label}?`;
+  $('export-confirm-proceed').textContent = `Export ${label}`;
+  dialog.showModal();
+}
+
 $('admin-toggle-inspection').addEventListener('click', () => toggleInspection($('admin-toggle-inspection')));
 $('inspector-toggle-inspection').addEventListener('click', () => toggleInspection($('inspector-toggle-inspection')));
+for (const [id, label] of [['export-jsonl', 'JSONL'], ['export-har', 'HAR'], ['export-csv', 'CSV']]) {
+  const el = $(id);
+  if (el) {
+    el.addEventListener('click', event => {
+      event.preventDefault();
+      requestExportConfirmation(el.href, label);
+    });
+  }
+}
+if ($('export-confirm-cancel')) {
+  $('export-confirm-cancel').addEventListener('click', () => {
+    pendingExportUrl = null;
+    $('export-confirm-dialog').close();
+  });
+}
+if ($('export-confirm-proceed')) {
+  $('export-confirm-proceed').addEventListener('click', () => {
+    const url = pendingExportUrl;
+    pendingExportUrl = null;
+    $('export-confirm-dialog').close();
+    if (url) triggerExportDownload(url);
+  });
+}
+if ($('export-confirm-dialog')) {
+  const dialog = $('export-confirm-dialog');
+  dialog.addEventListener('cancel', () => { pendingExportUrl = null; });
+  dialog.addEventListener('click', event => {
+    if (event.target === dialog) {
+      pendingExportUrl = null;
+      dialog.close();
+    }
+  });
+}
 $('pause-flows').addEventListener('click', () => {
   flowsPaused = !flowsPaused;
   $('pause-flows').textContent = flowsPaused ? 'Resume' : 'Pause';

@@ -4,8 +4,7 @@ Baseline: 2026-11-24. NetBridge is a portable Wi-Fi **Network Tap** for the M5St
 
 Next priorities:
 1. **Full unredacted logging** (remove remaining query-parameter redaction in `portal/proxy_addon.py` so all logged URLs, headers, cookies, tokens, and payloads are visible in full).
-2. **Plain-text export warning & confirmation** in `/inspector` before downloading `JSONL`, `HAR`, or `CSV` exports.
-3. **Continuous live WebSocket frame tracking** (`websocket_start` and `websocket_message` hooks in `portal/proxy_addon.py` so long-lived open WebSockets appear immediately and stream frames live in `/inspector` instead of waiting for `websocket_end`).
+2. **Continuous live WebSocket frame tracking** (`websocket_start` and `websocket_message` hooks in `portal/proxy_addon.py` so long-lived open WebSockets appear immediately and stream frames live in `/inspector` instead of waiting for `websocket_end`).
 
 These are future tasks, not claims of completed functionality or authorization to deploy unreviewed interception.
 
@@ -100,10 +99,10 @@ remain visible as failures; UI works cleanly when inspection is off.
 
 - Keep `JSONL`, `HAR`, and `CSV` exports **unredacted** so exported logs match
   the full traffic visible in `/inspector`.
-- **Plain-text export warning and confirmation**: add a confirmation prompt in
-  `/inspector` before downloading `JSONL`, `HAR`, or `CSV` exports that warns
-  the user plain-text exports can expose sensitive information (such as tokens,
-  cookies, or credentials) and asks them to confirm they want to export.
+- **Plain-text export warning and confirmation** (implemented in `/inspector`):
+  downloading `JSONL`, `HAR`, `CSV`, raw payloads, or hex dumps presents a
+  confirmation modal warning that plain-text exports can expose sensitive
+  information (such as tokens, cookies, or credentials).
 - Add export manifests with artifact hashes, UTC timestamps/timezone, applied
   filters, explicit quotas, retention limits, low-disk cutoff, and purge
   controls.
