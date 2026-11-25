@@ -56,6 +56,8 @@ def main():
         candidate.unlink(missing_ok=True)
     write(Path('/usr/share/APPLaunch/share/images/netbridge-icon.png'),
           (SOURCE / 'assets/netbridge-icon.png').read_bytes(), 0o644)
+    write(DEST / 'adversaryicu-logo.png',
+          (SOURCE / 'assets/adversaryicu-logo.png').read_bytes(), 0o644)
     write(Path('/usr/share/APPLaunch/applications/netbridge.desktop'),
           (SOURCE / 'netbridge.desktop').read_bytes(), 0o644)
     print('NetBridge installed in APPLaunch; no NetBridge boot services enabled.')

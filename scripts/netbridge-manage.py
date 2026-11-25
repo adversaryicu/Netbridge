@@ -170,6 +170,7 @@ def do_update(args):
     for unit in SYSTEMD_UNITS:
         _write_bytes(SYSTEMD_DIR / unit, (SOURCE / 'systemd' / unit).read_bytes(), 0o644)
     _write_bytes(APPLAUNCH_IMAGES / 'netbridge-icon.png', (SOURCE / 'assets/netbridge-icon.png').read_bytes(), 0o644)
+    _write_bytes(DEST / 'adversaryicu-logo.png', (SOURCE / 'assets/adversaryicu-logo.png').read_bytes(), 0o644)
     _write_bytes(APPLAUNCH_APPS / 'netbridge.desktop', (SOURCE / 'netbridge.desktop').read_bytes(), 0o644)
 
     run('systemctl', 'daemon-reload', timeout=30)
