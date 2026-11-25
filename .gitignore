@@ -1,11 +1,7 @@
-# Original/private design material
+# Original/private design material and local docs
 ../NetBridge_Software_Design_Specification.docx
 NetBridge_Software_Design_Specification.docx
-docs/HANDOFF.md
-docs/phase1-validation.md
-docs/phase2-validation.md
-docs/app-validation.md
-docs/memory-validation.md
+docs/
 
 # Device identity, credentials, and runtime state
 *.pem
