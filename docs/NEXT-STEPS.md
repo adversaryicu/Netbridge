@@ -40,14 +40,16 @@ security and maintenance work. Preserve mitmdump as the only inspection engine.
 - Improve actionable on-screen startup/cleanup errors and pending pairing-code
   expiry behavior; UI currently directs failures to the session log.
 - Review renewal/exit races and recovery if power loss interrupts startup/cleanup.
-- Add complete uninstall/update handling with explicit identity-retention choices.
-  Avoid overwriting changed configuration with source defaults during updates.
-- Package the program into a distributable ARM64 `.deb` file for publication
-  to the **Cardputer Store**, including dependencies, precompiled native
-  watchdog (`netbridge-lease`), APPLaunch desktop/icon integration, and
-  maintainer scripts for clean install/upgrade/uninstall without overwriting
-  existing device config or identity; test on a fresh Cardputer image without
-  removing existing services.
+- Unified install/update/uninstall with identity-retention choices is now
+  implemented via `install.sh` and `scripts/netbridge-manage.py` (preserving
+  `/etc/netbridge` and `/var/lib/netbridge` on `update` and default `uninstall`,
+  with `--purge` for full removal).
+- **Cardputer Store / privilege evaluation**: `cp0-dev.md` prohibits root-privileged
+  Store packages, while transparent `nftables` interception requires `CAP_NET_ADMIN`
+  and NetworkManager AP control. Primary distribution is GitHub over SSH; evaluate
+  with `CardputerZero/packages` maintainers whether a non-root `User=netbridge`
+  service with `CAP_NET_ADMIN` is acceptable before investing in `.deb` Store
+  packaging.
 
 Acceptance: existing desktop/launcher/network profiles retained; app off at boot;
 known failures recover predictably; repeatable fresh install and update.

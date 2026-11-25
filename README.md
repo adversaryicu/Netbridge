@@ -19,7 +19,7 @@ The goal of NetBridge is **full, unredacted visibility** into client traffic. On
 
 - **Portable Wi-Fi tap**: NetworkManager shared-mode WPA2 access point (`wlan0`) with DHCP, DNS, and Ethernet NAT (`eth0`) acting as an inline tap for connected test devices.
 - **Opt-in transparent `mitmdump` inspection** (`netbridge-proxy.service` on `:8080`): redirects outbound public TCP traffic on `wlan0` (excluding the local portal, DNS, and protected subnets) only for explicitly approved and opted-in clients, with automatic fail-open firewall removal if the proxy stops or fails health checks.
-- **Full-page Traffic & Application Inspector** (`/inspector`): dark-themed live UI with a heartbeat strip (`STATUS`, `RING`, `LAST EVENT`, `LAST POLL`), per-event timestamps, client and substring filters, full request/response headers, formatted body preview, raw payload download, side-by-side hex dump (`--set stream_large_bodies=524288`, `64 KiB` HTTP payload preview, `32 KiB` TCP/WebSocket buffer), TLS/connection metadata, and authenticated `JSONL`, `HAR`, and `CSV` exports.
+- **Full-page Traffic & Application Inspector** (`/inspector`): dark-themed live UI with a heartbeat strip (`STATUS`, `RING`, `LAST EVENT`, `LAST POLL`), per-event timestamps, **Capture Ingest Filters** (`All`/`None`, 8 granular categories, optional `Skip OS/Browser Noise` telemetry exclusion, and `Ingest host…` filter applied before reading payloads), client and substring filters, on-demand **Deep Search** across headers, URLs, and payloads, browser-only `sessionStorage` tab caching for offline/crash resilience, full request/response headers, formatted body preview, raw payload download, side-by-side hex dump (`--set stream_large_bodies=524288`, `64 KiB` HTTP payload preview, `32 KiB` TCP/WebSocket buffer), TLS/connection metadata, `Payload Status` completeness indicator, and authenticated `JSONL`, `HAR`, and `CSV` exports.
 - **Unified CA onboarding & Browser Trust Verification** (`/` and `/trust`): public CA download, platform install instructions, SHA-256 fingerprint, and HTTPS reachability check.
 - **Persistent device-local PKI**: RSA-2048 CA with explicit rotation, a separate portal certificate, and a dedicated proxy CA directory (`/etc/netbridge/proxy-ca`).
 - **Network & host isolation**: dedicated `inet netbridge` nftables table blocking AP access to host management and upstream private networks; IPv6 disabled on the AP to prevent unhandled bypass paths; UDP/443 QUIC rejection for inspected clients so traffic falls back to TCP/TLS.
@@ -42,21 +42,30 @@ The goal of NetBridge is **full, unredacted visibility** into client traffic. On
 The implementation is device-specific. It validates the Wi-Fi country/interface
 configuration and refuses to overwrite unknown NetworkManager resources.
 
-## Install on a Cardputer
+## Install on a Cardputer Zero (via SSH)
 
 Read the source and review the network policy before applying it to a device you
-own or are authorized to administer. From this repository on the Cardputer:
+own or are authorized to administer. Connect to your Cardputer Zero over
+Ethernet SSH, clone this repository, and run the unified installer:
 
 ```sh
-python3 -m unittest discover -s tests -v
-sudo python3 scripts/netbridge-network.py install
-sudo python3 scripts/netbridge-portal.py install
-sudo python3 scripts/install-app.py --user "$USER"
+git clone https://github.com/adversaryicu/Netbridge.git
+cd Netbridge
+chmod +x install.sh
+sudo ./install.sh --apt
 ```
 
-`netbridge-portal.py install` provisions the isolated `mitmdump` virtual
-environment at `/usr/local/lib/netbridge/mitm-venv` and publishes the proxy CA
-identity under `/etc/netbridge/proxy-ca`.
+`install.sh` (backed by `scripts/netbridge-manage.py`):
+- Checks system prerequisites (pass `--apt` to install missing Debian packages:
+  `python3-h11`, `python3-cryptography`, `python3-pil`, `python3-venv`, `gcc`).
+- Runs the unit test suite (`python3 -m unittest discover -s tests -v`).
+- Configures the isolated `netbridge-ap` NetworkManager profile and `inet netbridge`
+  nftables rules (`scripts/netbridge-network.py install`).
+- Provisions `/usr/local/lib/netbridge/mitm-venv` (`mitmdump`), the portal/controller
+  services, and the device-local CA under `/etc/netbridge/proxy-ca`
+  (`scripts/netbridge-portal.py install`).
+- Compiles the native heartbeat watchdog (`netbridge-lease`) and integrates
+  **NetBridge** into APPLaunch (`scripts/install-app.py --user "$SUDO_USER"`).
 
 Then open **NetBridge** from APPLaunch. It displays the SSID, password, and portal
 URL. Connect a device you own or are authorized to inspect, open the displayed
@@ -72,6 +81,36 @@ The app records the currently active Wi-Fi profile at launch. Press **ESC** to
 stop the NetBridge-owned services and restore that profile. A transient systemd
 session also cleans up after a crash or stale heartbeat. NetBridge services are
 not enabled at boot.
+
+### Update, Status & Uninstall
+
+From the cloned `Netbridge` directory over SSH:
+
+```sh
+# Pull latest changes from GitHub, run tests, and update code/units while
+# preserving /etc/netbridge config, CA identity, and admin credentials:
+sudo ./install.sh update
+
+# Check installation, active services, and CA fingerprint:
+sudo ./install.sh status
+
+# Remove services, AP profile, firewall rules, and APPLaunch entry
+# (retains CA identity and config in /etc/netbridge and /var/lib/netbridge):
+sudo ./install.sh uninstall
+
+# Complete removal including CA identity, admin account, config, and service users:
+sudo ./install.sh uninstall --purge
+```
+
+## Distribution & Cardputer Store Note
+
+NetBridge is currently distributed via GitHub over SSH rather than the Cardputer
+Store because inline transparent interception (`nftables` NAT redirects and
+`NetworkManager` AP bridging) requires `CAP_NET_ADMIN` and system network
+privileges, whereas Cardputer Store guidelines prohibit apps requiring root
+privileges. Once the feature set and validation are complete, Store compatibility
+(e.g., whether a non-root service user with `CAP_NET_ADMIN` is acceptable for the
+`Security` category) can be raised with `CardputerZero/packages` maintainers.
 
 ## Security model
 
