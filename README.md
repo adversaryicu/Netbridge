@@ -55,7 +55,7 @@ sudo ./install.sh uninstall --purge  # Remove everything including CA, admin, an
 ## Security & Distribution
 
 - **Authorized use only**: Device-local secrets (CA private key, Wi-Fi passphrase, admin credentials) never leave the device; NetBridge does not bypass certificate pinning or silently install CAs.
-- **Why GitHub over SSH**: Inline `nftables` redirection (`CAP_NET_ADMIN`) and `NetworkManager` AP control require elevated network privileges, which conflicts with the Cardputer Store's non-root app rule. Store packaging will be revisited with `CardputerZero/packages` maintainers once validation is complete.
+- **Why GitHub over SSH**: Inline `nftables` redirection (`CAP_NET_ADMIN`) and `NetworkManager` AP control require elevated network privileges, which conflicts with the Cardputer Store's non-root app rule.
 
 ## License
 
