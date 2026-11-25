@@ -4,8 +4,61 @@ let csrf = '', pairing = false, trustChallenge = '', refreshTimer;
 let inspectionState = 'off', lastFlows = [], lastClients = [];
 let selectedFlowId = null, selectedDetail = null, activeTab = 'response';
 let viewMode = { request: 'auto', response: 'auto' };
-let flowsPaused = false, pollBusy = false;
-let pendingExportUrl = null;
+let flowsPaused = false, pollBusy = false, filterSaveBusy = false;
+let pendingExportUrl = null, deepSearchMatchMap = null;
+const INSPECTOR_CACHE_KEY = 'netbridge.inspector.cache.v1';
+let flowDetailCache = new Map();
+
+function saveInspectorCache() {
+  try {
+    const payload = () => JSON.stringify({
+      flows: lastFlows,
+      details: Array.from(flowDetailCache.entries()),
+    });
+    try {
+      sessionStorage.setItem(INSPECTOR_CACHE_KEY, payload());
+    } catch (_) {
+      while (flowDetailCache.size > 0) {
+        const oldestKey = flowDetailCache.keys().next().value;
+        flowDetailCache.delete(oldestKey);
+        try {
+          sessionStorage.setItem(INSPECTOR_CACHE_KEY, payload());
+          return;
+        } catch (_) {}
+      }
+      sessionStorage.setItem(INSPECTOR_CACHE_KEY, JSON.stringify({ flows: lastFlows, details: [] }));
+    }
+  } catch (_) {}
+}
+function loadInspectorCache() {
+  try {
+    const raw = sessionStorage.getItem(INSPECTOR_CACHE_KEY);
+    if (!raw) return false;
+    const data = JSON.parse(raw);
+    if (!data || !Array.isArray(data.flows) || !data.flows.length) return false;
+    lastFlows = data.flows;
+    flowDetailCache = new Map(Array.isArray(data.details) ? data.details : []);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+function clearInspectorCache() {
+  flowDetailCache.clear();
+  try { sessionStorage.removeItem(INSPECTOR_CACHE_KEY); } catch (_) {}
+}
+function showOfflineCachedInspector(message) {
+  showView('inspector');
+  $('hb-flows').textContent = `${lastFlows.length} / 80`;
+  $('hb-last-event').textContent = lastFlows.length ? formatClock(lastFlows[0].time, true) : 'None yet';
+  if ($('hb-state')) {
+    $('hb-state').textContent = 'OFFLINE (CACHED)';
+    $('hb-state').className = 'state-warn';
+  }
+  updateClientFilterOptions();
+  renderFlows();
+  notice(message, true);
+}
 const secure = location.protocol === 'https:';
 const httpsBase = `https://${location.hostname}`;
 const path = location.pathname;
@@ -130,6 +183,7 @@ function updateClientFilterOptions() {
   select.value = seen.has(current) ? current : '';
 }
 function matchesFilter(f) {
+  if (deepSearchMatchMap && !deepSearchMatchMap.has(f.id)) return false;
   const clientFilter = $('filter-client').value;
   const q = $('filter-host').value.trim().toLowerCase();
   const stateFilter = $('filter-state').value;
@@ -166,7 +220,9 @@ function renderFlows() {
     const cType = document.createElement('span'); cType.className = `flow-type kind-${kind}`; cType.textContent = badgeText;
     const cPath = document.createElement('span'); cPath.className = 'flow-path'; cPath.textContent = flowTargetLabel(f); cPath.title = cPath.textContent;
     const cMethod = document.createElement('span'); cMethod.className = 'flow-cell'; cMethod.textContent = f.method;
-    const cStatus = document.createElement('span'); cStatus.className = f.status >= 400 || f.state === 'tls_failed' || f.state === 'error' ? 'flow-cell warn' : 'flow-cell';
+    const isWsNormal = f.state === 'websocket' && (f.status === 101 || f.status === 1000 || f.status === 1001);
+    const isErrStatus = (f.status >= 400 && !isWsNormal) || f.state === 'tls_failed' || f.state === 'error';
+    const cStatus = document.createElement('span'); cStatus.className = isErrStatus ? 'flow-cell warn' : 'flow-cell';
     cStatus.textContent = f.status ? String(f.status) : (f.state === 'tcp' ? 'TCP' : (f.state === 'tls_failed' ? 'TLS' : 'ERR'));
     const cSize = document.createElement('span'); cSize.className = 'flow-cell num';
     cSize.textContent = f.state === 'tcp' ? formatBytes((f.req_bytes || 0) + (f.bytes || 0)) : formatBytes(f.bytes);
@@ -186,8 +242,27 @@ async function selectFlow(flowId) {
   $('inspector-body').replaceChildren();
   try {
     selectedDetail = await api(`flow?id=${encodeURIComponent(flowId)}`);
+    flowDetailCache.set(flowId, selectedDetail);
+    saveInspectorCache();
     renderInspector();
   } catch (error) {
+    if (flowDetailCache.has(flowId)) {
+      selectedDetail = flowDetailCache.get(flowId);
+      renderInspector();
+      notice(`Offline — showing browser-cached details for flow #${flowId}.`, true);
+      return;
+    }
+    const summary = lastFlows.find(f => f.id === flowId);
+    if (summary) {
+      selectedDetail = {
+        flow: summary,
+        request: { captured: 0, size: summary.req_bytes || 0 },
+        response: { captured: 0, size: summary.bytes || 0 },
+      };
+      renderInspector();
+      notice('Offline — showing cached flow summary (full payload was not cached before disconnect).', true);
+      return;
+    }
     $('inspector-title').textContent = 'Unable to load flow';
     $('inspector-subtitle').textContent = error.message;
   }
@@ -367,6 +442,7 @@ function renderDetailsTab() {
     ['Duration', `${f.duration_ms || 0} ms`],
     ['Request Size', formatBytes(f.req_bytes || 0)],
     ['Response Size', formatBytes(f.bytes || 0)],
+    ['Payload Status', f.payload_status || '—'],
     ...(f.detail ? [['Note', f.detail]] : []),
   ]);
 
@@ -397,6 +473,13 @@ function scheduleRefresh() {
     if (error.status === 401) {
       showView('authentication');
       notice('Session expired. Sign in again.');
+    } else if (isInspectorPage && lastFlows.length) {
+      if ($('hb-state')) {
+        $('hb-state').textContent = 'OFFLINE (CACHED)';
+        $('hb-state').className = 'state-warn';
+      }
+      notice(`Connection lost — viewing ${lastFlows.length} browser-cached flows. Cache clears when this tab closes.`, true);
+      scheduleRefresh();
     } else {
       notice(error.message, true);
       scheduleRefresh();
@@ -416,12 +499,23 @@ async function refreshProtected() {
 
     if (isInspectorPage) {
       showView('inspector');
+      if (!filterSaveBusy && Array.isArray(state.capture_filters)) {
+        const active = new Set(state.capture_filters);
+        for (const cb of document.querySelectorAll('#ingest-bar input[data-ingest]')) {
+          cb.checked = active.has(cb.dataset.ingest);
+        }
+        if ($('ingest-skip-noise')) $('ingest-skip-noise').checked = Boolean(state.capture_skip_noise);
+        if ($('ingest-host') && document.activeElement !== $('ingest-host')) {
+          $('ingest-host').value = state.capture_host_filter || '';
+        }
+      }
       $('hb-flows').textContent = `${lastFlows.length} / 80`;
       $('hb-last-poll').textContent = formatClock(new Date().toISOString(), false);
       $('hb-last-event').textContent = lastFlows.length ? formatClock(lastFlows[0].time, true) : 'None yet';
       if (!flowsPaused) {
         updateClientFilterOptions();
         renderFlows();
+        saveInspectorCache();
       }
     } else {
       showView('admin');
@@ -524,6 +618,7 @@ async function signOut() {
   try {
     await api('logout', {});
     clearTimeout(refreshTimer);
+    clearInspectorCache();
     showView('authentication');
     notice('Signed out.');
   } catch (error) {
@@ -550,6 +645,10 @@ async function init() {
     $('fingerprint').textContent = info.ca.fingerprint;
     $('ca-expiry').textContent = new Date(info.ca.expires).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
   } catch (error) {
+    if (isInspectorPage && loadInspectorCache()) {
+      showOfflineCachedInspector(`Cardputer unreachable — viewing ${lastFlows.length} browser-cached flows from this tab.`);
+      return;
+    }
     notice(error.message, true);
     showView('setup');
     return;
@@ -567,6 +666,10 @@ async function init() {
     try {
       await refreshProtected();
     } catch (error) {
+      if (isInspectorPage && error.status !== 401 && loadInspectorCache()) {
+        showOfflineCachedInspector(`Cardputer unreachable — viewing ${lastFlows.length} browser-cached flows from this tab.`);
+        return;
+      }
       showView('authentication');
       if (error.status !== 401) notice(error.message, true);
     }
@@ -685,6 +788,8 @@ $('clear-flows').addEventListener('click', async () => {
   try {
     await api('flows-clear', {});
     lastFlows = []; selectedFlowId = null; selectedDetail = null;
+    clearInspectorCache();
+    clearDeepSearch(false);
     $('inspector-content').hidden = true; $('inspector-empty').hidden = false;
     $('hb-flows').textContent = '0 / 80';
     $('hb-last-event').textContent = 'Cleared';
@@ -705,6 +810,106 @@ $('inspector-close').addEventListener('click', () => {
 $('filter-client').addEventListener('change', renderFlows);
 $('filter-host').addEventListener('input', renderFlows);
 $('filter-state').addEventListener('change', renderFlows);
+
+async function saveCaptureFilters() {
+  const categories = Array.from(document.querySelectorAll('#ingest-bar input[data-ingest]:checked'))
+    .map(el => el.dataset.ingest);
+  const host_filter = $('ingest-host') ? $('ingest-host').value.trim() : '';
+  const skip_noise = $('ingest-skip-noise') ? $('ingest-skip-noise').checked : false;
+  filterSaveBusy = true;
+  try {
+    const result = await api('capture-filters', { categories, host_filter, skip_noise });
+    const count = (result.capture_filters || categories).length;
+    const parts = [`${count}/8 categories`];
+    if (result.capture_skip_noise) parts.push('noise skipped');
+    if (result.capture_host_filter) parts.push(`host: ${result.capture_host_filter}`);
+    notice(`Capture ingest updated (${parts.join(' · ')}).`);
+  } catch (error) {
+    notice(error.message, true);
+  } finally {
+    filterSaveBusy = false;
+  }
+}
+
+for (const cb of document.querySelectorAll('#ingest-bar input[data-ingest]')) {
+  cb.addEventListener('change', saveCaptureFilters);
+}
+if ($('ingest-skip-noise')) {
+  $('ingest-skip-noise').addEventListener('change', saveCaptureFilters);
+}
+if ($('ingest-all')) {
+  $('ingest-all').addEventListener('click', () => {
+    for (const cb of document.querySelectorAll('#ingest-bar input[data-ingest]')) cb.checked = true;
+    saveCaptureFilters();
+  });
+}
+if ($('ingest-none')) {
+  $('ingest-none').addEventListener('click', () => {
+    for (const cb of document.querySelectorAll('#ingest-bar input[data-ingest]')) cb.checked = false;
+    saveCaptureFilters();
+  });
+}
+if ($('ingest-host-apply')) {
+  $('ingest-host-apply').addEventListener('click', saveCaptureFilters);
+}
+if ($('ingest-host')) {
+  $('ingest-host').addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      saveCaptureFilters();
+    }
+  });
+}
+
+function clearDeepSearch(rerender = true) {
+  deepSearchMatchMap = null;
+  if ($('deep-search-input')) $('deep-search-input').value = '';
+  if ($('deep-search-clear')) $('deep-search-clear').hidden = true;
+  if ($('deep-search-status')) {
+    $('deep-search-status').hidden = true;
+    $('deep-search-status').textContent = '';
+  }
+  if (rerender) renderFlows();
+}
+
+async function runDeepSearch() {
+  const q = $('deep-search-input') ? $('deep-search-input').value.trim() : '';
+  if (!q) {
+    clearDeepSearch(true);
+    return;
+  }
+  const btn = $('deep-search-btn');
+  if (btn) btn.disabled = true;
+  try {
+    const result = await api(`flows-search?q=${encodeURIComponent(q)}`);
+    const map = new Map();
+    for (const m of (result.matches || [])) {
+      map.set(m.id, m.where || []);
+    }
+    deepSearchMatchMap = map;
+    if ($('deep-search-clear')) $('deep-search-clear').hidden = false;
+    if ($('deep-search-status')) {
+      $('deep-search-status').hidden = false;
+      $('deep-search-status').textContent = `Deep search "${result.query}": ${map.size} match${map.size === 1 ? '' : 'es'}`;
+    }
+    renderFlows();
+  } catch (error) {
+    notice(error.message, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+if ($('deep-search-btn')) $('deep-search-btn').addEventListener('click', runDeepSearch);
+if ($('deep-search-clear')) $('deep-search-clear').addEventListener('click', () => clearDeepSearch(true));
+if ($('deep-search-input')) {
+  $('deep-search-input').addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      runDeepSearch();
+    }
+  });
+}
 $('admin-logout').addEventListener('click', signOut);
 $('inspector-logout').addEventListener('click', signOut);
 $('admin-refresh').addEventListener('click', () => refreshProtected().catch(error => notice(error.message, true)));

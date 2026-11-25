@@ -121,13 +121,11 @@ PSS reaches about 85–86 MiB with 0 MiB swap. Full simultaneous process-tree
 profiling (including AP/launcher/lease processes) remains on the roadmap.
 
 Current gaps and upcoming work:
-- **Full unredacted logging**: remove the remaining query-parameter redaction in
-  `portal/proxy_addon.py` so all logged URLs and parameters appear in full.
 - **Continuous live WebSocket frame tracking**: stream frames in real time while
   sockets remain open (`websocket_start` / `websocket_message`), in addition to
   `websocket_end` capture.
-- **Full simultaneous process-tree memory baseline** and lifecycle edge-case
-  validation.
+- **Full simultaneous process-tree memory baseline** and on-device validation
+  (see [REVISIONS-2026-11-24.md](docs/REVISIONS-2026-11-24.md)).
 - **ARM64 `.deb` packaging** for distribution via the Cardputer Store.
 
 See [NEXT-STEPS.md](docs/NEXT-STEPS.md) for acceptance gates and known gaps.

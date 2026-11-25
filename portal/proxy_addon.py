@@ -3,17 +3,60 @@
 import base64
 from datetime import datetime, timezone
 import gc
+import io
 import json
 from pathlib import Path
 import queue
 import socket
 import threading
 import time
-from urllib.parse import parse_qsl, quote_plus, urlsplit
 import uuid
+import zlib
+
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
 
 SOCKET = '/run/netbridge/control.sock'
 STAGE_DIR = Path('/run/netbridge/proxy-stage')
+CAPTURE_FILTERS_FILE = Path('/run/netbridge/capture-filters.json')
+ALL_CAPTURE_CATEGORIES = frozenset({'html', 'json', 'assets', 'images', 'binary', 'websocket', 'tcp', 'errors'})
+NOISE_HOST_SUFFIXES = (
+    # Windows & Office 365 background telemetry / connectivity / CRL
+    'telemetry.microsoft.com',
+    'vortex.data.microsoft.com',
+    'events.data.microsoft.com',
+    'browser.events.data.microsoft.com',
+    'aria.microsoft.com',
+    'msftconnecttest.com',
+    'msftncsi.com',
+    'windowsupdate.com',
+    'update.microsoft.com',
+    'settings-win.data.microsoft.com',
+    'watson.telemetry.microsoft.com',
+    'ocsp.digicert.com',
+    'crl.microsoft.com',
+    # Chrome / Edge background sync, safebrowsing & updates
+    'clients2.google.com',
+    'clients4.google.com',
+    'update.googleapis.com',
+    'safebrowsing.googleapis.com',
+    'optimizationguide-pa.googleapis.com',
+    'edge.microsoft.com',
+    'nav-edge.smartscreen.microsoft.com',
+    # Firefox background telemetry, captive portal & remote settings
+    'detectportal.firefox.com',
+    'incoming.telemetry.mozilla.org',
+    'firefox.settings.services.mozilla.com',
+    'push.services.mozilla.com',
+    'shavar.services.mozilla.com',
+    'contile.services.mozilla.com',
+    # Apple captive portal & metrics
+    'captive.apple.com',
+    'metrics.icloud.com',
+    'xp.apple.com',
+)
 MAX_HTTP_BODY = 65536
 MAX_TCP_BODY = 32768
 MAX_DECOMPRESS_RAW = 262144
@@ -22,43 +65,6 @@ MAX_HEADER_VAL = 2048
 MAX_URL = 2048
 MAX_QUEUE = 32
 MAX_STAGE_FILES = 48
-
-SENSITIVE_KEYS = frozenset({
-    'password', 'passwd', 'pass', 'pwd', 'token', 'access_token',
-    'refresh_token', 'id_token', 'auth', 'authorization', 'key',
-    'api_key', 'apikey', 'secret', 'client_secret', 'session',
-    'sessionid', 'sid', 'code', 'jwt', 'credential', 'credentials',
-    'cookie', 'sig', 'signature', 'private_key', 'bearer',
-})
-SENSITIVE_SUBSTRINGS = ('token', 'secret', 'password', 'passwd', 'apikey', 'api_key', 'auth')
-
-
-def is_sensitive_key(name):
-    lower = (name or '').strip().lower()
-    if lower in SENSITIVE_KEYS:
-        return True
-    return any(part in lower for part in SENSITIVE_SUBSTRINGS)
-
-
-def redact_path(raw_path):
-    if not raw_path:
-        return '/'
-    parts = urlsplit(str(raw_path))
-    path = parts.path or '/'
-    if parts.query:
-        pairs = []
-        for key, value in parse_qsl(parts.query, keep_blank_values=True):
-            encoded_key = quote_plus(key)
-            if is_sensitive_key(key):
-                pairs.append(f'{encoded_key}=[REDACTED]')
-            else:
-                pairs.append(f'{encoded_key}={quote_plus(value)}')
-        full = f"{path}?{'&'.join(pairs)}"
-    else:
-        full = path
-    if len(full) > 160:
-        return full[:157] + '...'
-    return full
 
 
 def utc_iso(ts=None):
@@ -138,6 +144,44 @@ def extract_conn(conn):
     return info
 
 
+def _bounded_decompress_gzip(raw_compressed, limit):
+    decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = decomp.decompress(raw_compressed, limit + 1)
+    if len(out) <= limit and not decomp.unconsumed_tail:
+        tail = decomp.flush(limit + 1 - len(out))
+        out += tail
+    if len(out) > limit or decomp.unconsumed_tail:
+        return out[:limit], max(len(out), len(raw_compressed)), True
+    return out, len(out), False
+
+
+def _bounded_decompress_deflate(raw_compressed, limit):
+    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+        try:
+            decomp = zlib.decompressobj(wbits)
+            out = decomp.decompress(raw_compressed, limit + 1)
+            if len(out) <= limit and not decomp.unconsumed_tail:
+                tail = decomp.flush(limit + 1 - len(out))
+                out += tail
+            if len(out) > limit or decomp.unconsumed_tail:
+                return out[:limit], max(len(out), len(raw_compressed)), True
+            return out, len(out), False
+        except zlib.error:
+            continue
+    raise zlib.error('Invalid deflate stream')
+
+
+def _bounded_decompress_zstd(raw_compressed, limit):
+    if zstandard is None:
+        return None
+    dctx = zstandard.ZstdDecompressor()
+    with dctx.stream_reader(io.BytesIO(raw_compressed)) as reader:
+        out = reader.read(limit + 1)
+    if len(out) > limit:
+        return out[:limit], max(len(out), len(raw_compressed)), True
+    return out, len(out), False
+
+
 def _read_message_bytes(message, limit=MAX_HTTP_BODY):
     if not message:
         return b'', 0, False
@@ -150,22 +194,39 @@ def _read_message_bytes(message, limit=MAX_HTTP_BODY):
         except ValueError:
             total = 0
         return b'', total, total > 0
+    if isinstance(raw_compressed, str):
+        raw_compressed = raw_compressed.encode('utf-8', errors='replace')
     raw_len = len(raw_compressed)
     if raw_len > MAX_DECOMPRESS_RAW:
         return bytes(raw_compressed[:limit]), raw_len, True
-    raw = None
+    encoding = _header_value(getattr(message, 'headers', None), 'content-encoding').lower().strip()
+    if not encoding or encoding == 'identity':
+        return bytes(raw_compressed[:limit]), raw_len, raw_len > limit
     try:
-        raw = getattr(message, 'content', None)
+        if encoding in ('gzip', 'x-gzip'):
+            return _bounded_decompress_gzip(raw_compressed, limit)
+        if encoding == 'deflate':
+            return _bounded_decompress_deflate(raw_compressed, limit)
+        if encoding == 'zstd' and zstandard is not None:
+            result = _bounded_decompress_zstd(raw_compressed, limit)
+            if result is not None:
+                return result
     except Exception:
-        raw = None
-    if raw is None:
-        raw = raw_compressed
-    if isinstance(raw, str):
-        raw = raw.encode('utf-8', errors='replace')
-    total = len(raw)
-    if total > limit:
-        return bytes(raw[:limit]), total, True
-    return bytes(raw), total, False
+        return bytes(raw_compressed[:limit]), raw_len, True
+    # Unknown or stacked encoding (e.g. br): keep bounded raw bytes without full expansion.
+    return bytes(raw_compressed[:limit]), raw_len, True
+
+
+def _http_payload_status(req, req_total, req_trunc, resp, resp_total, resp_trunc):
+    req_streamed = req is not None and getattr(req, 'raw_content', None) is None and req_total > 0
+    resp_streamed = resp is not None and getattr(resp, 'raw_content', None) is None and resp_total > 0
+    if req_streamed or resp_streamed:
+        return 'streamed'
+    if req_trunc or resp_trunc:
+        return 'partial'
+    if req_total == 0 and resp_total == 0:
+        return 'empty'
+    return 'complete'
 
 
 def send_event(payload, sock_path=SOCKET):
@@ -177,16 +238,89 @@ def send_event(payload, sock_path=SOCKET):
         client.recv(1024)
 
 
+def is_noise_host(host):
+    h = (host or '').strip().lower().rstrip('.')
+    if not h:
+        return False
+    return any(h == suffix or h.endswith('.' + suffix) for suffix in NOISE_HOST_SUFFIXES)
+
+
+def should_ingest(categories, kind, content_type='', status=0, is_error=False,
+                  host='', server_ip='', host_filter='', skip_noise=False):
+    if skip_noise and is_noise_host(host):
+        return False
+    hf = (host_filter or '').strip().lower()
+    if hf:
+        if hf not in (host or '').lower() and hf not in (server_ip or '').lower():
+            return False
+    if kind == 'http':
+        if status >= 400 and 'errors' in categories:
+            return True
+        c = (content_type or '').lower()
+        if c.startswith(('image/', 'video/', 'audio/')):
+            return 'images' in categories
+        if 'json' in c:
+            return 'json' in categories
+        if 'javascript' in c or 'ecmascript' in c or 'text/css' in c:
+            return 'assets' in categories
+        if c.startswith('font/') or any(t in c for t in ('woff', 'octet-stream', 'wasm', 'pdf', 'zip', 'gzip', 'protobuf')):
+            return 'binary' in categories
+        return 'html' in categories
+    if kind == 'websocket':
+        return 'websocket' in categories
+    if kind == 'tcp':
+        return ('tcp' in categories) or (is_error and 'errors' in categories)
+    if kind in ('error', 'tls_failed'):
+        return 'errors' in categories
+    return True
+
+
 class NetBridgeAddon:
-    def __init__(self, sock_path=SOCKET, stage_dir=STAGE_DIR, background=True):
+    def __init__(self, sock_path=SOCKET, stage_dir=STAGE_DIR, background=True, filters_file=CAPTURE_FILTERS_FILE):
         self.sock_path = sock_path
         self.stage_dir = Path(stage_dir)
+        self.filters_file = Path(filters_file) if filters_file is not None else None
+        self._filters_cache = (ALL_CAPTURE_CATEGORIES, '', False)
+        self._filters_mtime_ns = None
+        self._filters_checked_at = 0.0
         self._queue = queue.Queue(maxsize=MAX_QUEUE)
         self._background = background
         self._count = 0
         if background:
             thread = threading.Thread(target=self._worker, name='nb-flow-ipc', daemon=True)
             thread.start()
+
+    def _active_filters(self):
+        if self.filters_file is None:
+            return self._filters_cache
+        now = time.monotonic()
+        if now - self._filters_checked_at < 1.0:
+            return self._filters_cache
+        self._filters_checked_at = now
+        try:
+            st = self.filters_file.stat()
+            if st.st_mtime_ns != self._filters_mtime_ns:
+                data = json.loads(self.filters_file.read_text())
+                if isinstance(data, dict):
+                    raw = data.get('categories', [])
+                    parsed = frozenset(c for c in raw if c in ALL_CAPTURE_CATEGORIES)
+                    host_filter = str(data.get('host_filter', '') or '').strip()[:128]
+                    skip_noise = bool(data.get('skip_noise', False))
+                    self._filters_cache = (parsed, host_filter, skip_noise)
+                else:
+                    self._filters_cache = (ALL_CAPTURE_CATEGORIES, '', False)
+                self._filters_mtime_ns = st.st_mtime_ns
+        except (OSError, ValueError, TypeError):
+            self._filters_cache = (ALL_CAPTURE_CATEGORIES, '', False)
+            self._filters_mtime_ns = None
+        return self._filters_cache
+
+    def _should_ingest(self, kind, content_type='', status=0, is_error=False, host='', server_ip=''):
+        cats, host_filter, skip_noise = self._active_filters()
+        return should_ingest(
+            cats, kind, content_type=content_type, status=status, is_error=is_error,
+            host=host, server_ip=server_ip, host_filter=host_filter, skip_noise=skip_noise,
+        )
 
     def _stage_and_send(self, record):
         meta, req_bytes, resp_bytes = record
@@ -252,6 +386,11 @@ class NetBridgeAddon:
         resp = getattr(flow, 'response', None)
         if not req or not resp:
             return
+        ctype = _header_value(getattr(resp, 'headers', None), 'content-type').split(';')[0].strip()[:64]
+        status_code = int(getattr(resp, 'status_code', 0) or 0)
+        host = str(getattr(req, 'pretty_host', None) or getattr(req, 'host', '') or '')[:128]
+        if not self._should_ingest('http', content_type=ctype, status=status_code, host=host):
+            return
         client_conn = getattr(flow, 'client_conn', None)
         server_conn = getattr(flow, 'server_conn', None)
         scheme = (getattr(req, 'scheme', None) or 'http').lower()
@@ -260,7 +399,6 @@ class NetBridgeAddon:
         end = getattr(resp, 'timestamp_end', None) or time.time()
         req_bytes, req_total, req_trunc = _read_message_bytes(req, MAX_HTTP_BODY)
         resp_bytes, resp_total, resp_trunc = _read_message_bytes(resp, MAX_HTTP_BODY)
-        ctype = _header_value(getattr(resp, 'headers', None), 'content-type').split(';')[0].strip()[:64]
         req_ctype = _header_value(getattr(req, 'headers', None), 'content-type').split(';')[0].strip()[:64]
         server_info = extract_conn(server_conn)
         client_info = extract_conn(client_conn)
@@ -284,6 +422,7 @@ class NetBridgeAddon:
             'bytes': resp_total,
             'req_truncated': req_trunc,
             'resp_truncated': resp_trunc,
+            'payload_status': _http_payload_status(req, req_total, req_trunc, resp, resp_total, resp_trunc),
             'duration_ms': max(0, int((end - start) * 1000)),
             'state': 'decrypted' if is_tls else 'passthrough',
             'detail': '',
@@ -306,6 +445,9 @@ class NetBridgeAddon:
         ws = getattr(flow, 'websocket', None)
         req = getattr(flow, 'request', None)
         if not ws or not req:
+            return
+        host = str(getattr(req, 'pretty_host', None) or getattr(req, 'host', '') or '')[:128]
+        if not self._should_ingest('websocket', host=host):
             return
         client_conn = getattr(flow, 'client_conn', None)
         server_conn = getattr(flow, 'server_conn', None)
@@ -356,6 +498,7 @@ class NetBridgeAddon:
             'bytes': resp_total,
             'req_truncated': req_total > MAX_TCP_BODY,
             'resp_truncated': resp_total > MAX_TCP_BODY,
+            'payload_status': 'partial' if (req_total > MAX_TCP_BODY or resp_total > MAX_TCP_BODY) else ('empty' if req_total == 0 and resp_total == 0 else 'complete'),
             'duration_ms': max(0, int((end - start) * 1000)),
             'state': 'websocket',
             'detail': f'{len(transcript)} frames',
@@ -372,6 +515,10 @@ class NetBridgeAddon:
         server_conn = getattr(flow, 'server_conn', None)
         server_info = extract_conn(server_conn)
         client_info = extract_conn(client_conn)
+        sni = client_info.get('sni') or server_info.get('sni')
+        host = sni or server_info.get('ip') or 'unknown'
+        if not self._should_ingest('tcp', is_error=is_error, host=host, server_ip=server_info.get('ip', '')):
+            return
         is_tls = bool(client_info.get('tls') or server_info.get('tls'))
         client_buf = bytearray()
         server_buf = bytearray()
@@ -420,6 +567,7 @@ class NetBridgeAddon:
             'bytes': resp_total,
             'req_truncated': req_total > MAX_TCP_BODY,
             'resp_truncated': resp_total > MAX_TCP_BODY,
+            'payload_status': 'partial' if (req_total > MAX_TCP_BODY or resp_total > MAX_TCP_BODY) else ('empty' if req_total == 0 and resp_total == 0 else 'complete'),
             'duration_ms': max(0, int((end - start) * 1000)),
             'state': 'error' if is_error else 'tcp',
             'detail': detail,
@@ -449,6 +597,8 @@ class NetBridgeAddon:
             host = getattr(req, 'pretty_host', None) or getattr(req, 'host', '') or ''
         if not host:
             host = client_info.get('sni') or server_info.get('ip') or 'unknown'
+        if not self._should_ingest('error', host=str(host), server_ip=server_info.get('ip', '')):
+            return
         req_bytes, req_total, req_trunc = _read_message_bytes(req, MAX_HTTP_BODY) if req else (b'', 0, False)
         meta = {
             'time': utc_iso(),
@@ -469,6 +619,7 @@ class NetBridgeAddon:
             'bytes': 0,
             'req_truncated': req_trunc,
             'resp_truncated': False,
+            'payload_status': 'partial' if req_trunc else ('empty' if req_total == 0 else 'complete'),
             'duration_ms': 0,
             'state': 'error',
             'detail': str(getattr(err, 'msg', None) or 'Connection error')[:120],
@@ -492,6 +643,8 @@ class NetBridgeAddon:
             or server_info.get('ip')
             or 'unknown'
         )
+        if not self._should_ingest('tls_failed', host=str(host), server_ip=server_info.get('ip', '')):
+            return
         detail = (getattr(conn, 'error', None) if conn else None) or default_detail
         meta = {
             'time': utc_iso(),
@@ -512,6 +665,7 @@ class NetBridgeAddon:
             'bytes': 0,
             'req_truncated': False,
             'resp_truncated': False,
+            'payload_status': 'empty',
             'duration_ms': 0,
             'state': 'tls_failed',
             'detail': str(detail)[:120],

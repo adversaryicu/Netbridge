@@ -111,6 +111,7 @@ table inet netbridge {{
   }}
   chain input {{
     type filter hook input priority -10; policy accept;
+    iifname "{wan}" tcp dport 8080 counter drop
     iifname "{lan}" meta nfproto ipv6 counter drop
     iifname "{lan}" udp sport 68 udp dport 67 counter accept
     iifname "{lan}" ip saddr != {subnet} counter drop

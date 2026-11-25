@@ -3,7 +3,7 @@
 Baseline: 2026-11-24. NetBridge is a portable Wi-Fi **Network Tap** for the M5Stack Cardputer Zero, built to give operators full, unredacted visibility into the traffic of the devices and software they use.
 
 Next priorities:
-1. **Full unredacted logging** (remove remaining query-parameter redaction in `portal/proxy_addon.py` so all logged URLs, headers, cookies, tokens, and payloads are visible in full).
+1. **On-device validation of 2026-11-24 revisions** (see [REVISIONS-2026-11-24.md](REVISIONS-2026-11-24.md): bounded decompression lab test, WAN port `8080` isolation probe, header-validation regression check, fail-open crash test, and unredacted synthetic verification).
 2. **Continuous live WebSocket frame tracking** (`websocket_start` and `websocket_message` hooks in `portal/proxy_addon.py` so long-lived open WebSockets appear immediately and stream frames live in `/inspector` instead of waiting for `websocket_end`).
 
 These are future tasks, not claims of completed functionality or authorization to deploy unreviewed interception.
@@ -74,11 +74,11 @@ crash/hang/OOM removes redirects and restores connectivity cleanly.
 
 ## 4. Full-visibility inspection, filtering and live monitoring
 
-- **Remove query-parameter redaction**: remove `SENSITIVE_KEYS` / `redact_path`
-  redaction in `portal/proxy_addon.py` so all logged traffic—including full
-  URLs, query parameters, headers, cookies, tokens, and request/response
-  bodies—is captured and displayed in `/inspector` with nothing hidden or
-  redacted from the operator.
+- **Unredacted capture** (implemented): dead query-parameter redaction helpers
+  (`SENSITIVE_KEYS` / `redact_path`) have been removed from
+  `portal/proxy_addon.py`; all logged traffic—including full URLs, query
+  parameters, headers, cookies, tokens, and payloads—is captured and displayed
+  in `/inspector` with nothing hidden or redacted from the operator.
 - **Continuous live WebSocket frame tracking**: hook `websocket_start` and
   `websocket_message` in `portal/proxy_addon.py` (in addition to
   `websocket_end`) so long-lived open WebSocket connections (e.g. desktop app

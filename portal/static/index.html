@@ -260,6 +260,25 @@
         </div>
       </div>
 
+      <div class="ingest-bar" id="ingest-bar" aria-label="Capture ingest filters">
+        <span class="ingest-label">INGEST //</span>
+        <button class="quiet ingest-btn" id="ingest-all" type="button">All</button>
+        <button class="quiet ingest-btn" id="ingest-none" type="button">None</button>
+        <label class="ingest-chip"><input type="checkbox" data-ingest="html" checked> HTML / Text</label>
+        <label class="ingest-chip"><input type="checkbox" data-ingest="json" checked> JSON / API</label>
+        <label class="ingest-chip"><input type="checkbox" data-ingest="assets" checked> Scripts &amp; CSS</label>
+        <label class="ingest-chip"><input type="checkbox" data-ingest="images" checked> Images &amp; Media</label>
+        <label class="ingest-chip"><input type="checkbox" data-ingest="binary" checked> Fonts &amp; Binary</label>
+        <label class="ingest-chip"><input type="checkbox" data-ingest="websocket" checked> WebSockets</label>
+        <label class="ingest-chip"><input type="checkbox" data-ingest="tcp" checked> Raw TCP</label>
+        <label class="ingest-chip"><input type="checkbox" data-ingest="errors" checked> TLS / Errors</label>
+        <label class="ingest-chip" title="Exclude common Windows, O365, Chrome, Firefox, and Apple background telemetry/update endpoints"><input type="checkbox" id="ingest-skip-noise"> Skip OS/Browser Noise</label>
+        <span class="ingest-host-group">
+          <input id="ingest-host" class="ingest-host-input" type="search" maxlength="128" placeholder="Ingest host…" aria-label="Ingest host filter">
+          <button class="quiet ingest-btn" id="ingest-host-apply" type="button">Apply</button>
+        </span>
+      </div>
+
       <div class="flow-filters">
         <select id="filter-client" aria-label="Filter by client"><option value="">All clients</option></select>
         <input id="filter-host" type="search" placeholder="Filter host, path, IP, port, method, or MIME…" aria-label="Filter flows">
@@ -273,6 +292,13 @@
           <option value="errors">TLS / flow errors</option>
           <option value="http45">HTTP 4xx / 5xx</option>
         </select>
+      </div>
+
+      <div class="deep-search-row">
+        <input id="deep-search-input" type="search" maxlength="128" placeholder="Deep search across all headers, URLs &amp; payloads…" aria-label="Deep search across all logs">
+        <button class="quiet" id="deep-search-btn" type="button">Deep Search</button>
+        <button class="quiet" id="deep-search-clear" type="button" hidden>Clear Search</button>
+        <span id="deep-search-status" class="deep-search-status" hidden></span>
       </div>
 
       <div class="inspector-split">

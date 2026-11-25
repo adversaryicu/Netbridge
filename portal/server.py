@@ -233,6 +233,37 @@ def build_export(fmt, ids, flows_dir=None):
     raise Reject(400, 'Unsupported export format')
 
 
+def search_flows(query, ids, flows_dir=None):
+    q = (query or '').strip()
+    if not (1 <= len(q) <= 128):
+        raise Reject(400, 'Search query must be 1-128 characters')
+    needle = q.lower()
+    flows_dir = flows_dir or FLOWS_DIR
+    matches = []
+    for flow_id in reversed(list(ids)):
+        try:
+            m, req_raw, resp_raw = _read_flow_record(flow_id, flows_dir)
+        except Reject:
+            continue
+        where = []
+        url_blob = ' '.join(str(m.get(k, '') or '') for k in ('method', 'scheme', 'host', 'path', 'detail', 'server_ip')).lower()
+        if needle in url_blob:
+            where.append('url')
+        if any(needle in str(k).lower() or needle in str(v).lower() for k, v in (m.get('request_headers') or [])):
+            where.append('req_header')
+        if any(needle in str(k).lower() or needle in str(v).lower() for k, v in (m.get('response_headers') or [])):
+            where.append('resp_header')
+        if req_raw and is_text_payload(req_raw, m.get('req_content_type', '')):
+            if needle in req_raw.decode('utf-8', errors='replace').lower():
+                where.append('req_body')
+        if resp_raw and is_text_payload(resp_raw, m.get('content_type', '')):
+            if needle in resp_raw.decode('utf-8', errors='replace').lower():
+                where.append('resp_body')
+        if where:
+            matches.append({'id': flow_id, 'where': where})
+    return {'query': q, 'matches': matches}
+
+
 class Request:
     def __init__(self, event, body, remote, secure):
         self.method = event.method.decode('ascii')
@@ -313,9 +344,10 @@ class Portal:
                     pass
             return Response(body=pem, content_type='application/x-x509-ca-cert',
                             headers={'Content-Disposition':'attachment; filename="NetBridge-CA.crt"'})
-        reads = {'public', 'status', 'trust-probe', 'flow', 'flow-raw', 'flows-export'}
+        reads = {'public', 'status', 'trust-probe', 'flow', 'flow-raw', 'flows-export', 'flows-search'}
         writes = {'pair', 'login', 'logout', 'trust-confirm', 'approve', 'revoke',
-                  'admin-password', 'rotate-ca', 'ap-settings', 'inspection', 'flows-clear'}
+                  'admin-password', 'rotate-ca', 'ap-settings', 'inspection', 'flows-clear',
+                  'capture-filters'}
         action = request.path[5:] if request.path.startswith('/api/') else ''
         if not ((request.method == 'GET' and action in reads) or (request.method == 'POST' and action in writes)):
             raise Reject(404, 'Not found')
@@ -334,12 +366,15 @@ class Portal:
         except CookieError:
             raise Reject(400, 'Invalid cookie')
         session = cookies[COOKIE].value if COOKIE in cookies else ''
-        if action in ('flow', 'flow-raw', 'flows-export'):
+        if action in ('flow', 'flow-raw', 'flows-export', 'flows-search'):
             auth = await rpc({'action': 'flow-index', 'ip': request.remote, 'secure': request.secure,
                               'session': session, 'csrf': '', 'data': {}})
             if auth['status'] != 200:
                 return json_response(auth['data'], auth['status'])
             valid_ids = set(auth['data'].get('ids', []))
+            if action == 'flows-search':
+                q = request.query.get('q', [''])[0]
+                return json_response(search_flows(q, auth['data'].get('ids', [])))
             if action == 'flows-export':
                 fmt = request.query.get('format', ['jsonl'])[0].lower()
                 payload, ctype, ext = build_export(fmt, auth['data'].get('ids', []))

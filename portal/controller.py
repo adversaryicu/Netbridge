@@ -32,6 +32,8 @@ TLS = Path('/etc/netbridge/portal-tls')
 SOCKET = '/run/netbridge/control.sock'
 FLOWS_DIR = Path('/run/netbridge/flows')
 STAGE_DIR = Path('/run/netbridge/proxy-stage')
+CAPTURE_FILTERS_FILE = Path('/run/netbridge/capture-filters.json')
+CAPTURE_CATEGORIES = ('html', 'json', 'assets', 'images', 'binary', 'websocket', 'tcp', 'errors')
 MAX_FLOWS = 80
 MAX_FLOW_STORAGE_BYTES = 6 * 1024 * 1024
 SYS_NET = Path('/sys/class/net')
@@ -49,6 +51,9 @@ class Controller:
     _synced_inspected = ()
     flow_seq = 0
     flow_bytes = 0
+    capture_filters = list(CAPTURE_CATEGORIES)
+    capture_host_filter = ''
+    capture_skip_noise = False
 
     def __init__(self):
         self.config = tomllib.loads(Path('/etc/netbridge/phase1.toml').read_text())
@@ -66,6 +71,9 @@ class Controller:
         self.flows = deque()
         self.flow_seq = 0
         self.flow_bytes = 0
+        self.capture_filters = list(CAPTURE_CATEGORIES)
+        self.capture_host_filter = ''
+        self.capture_skip_noise = False
         self.flow_sizes = {}
         self.inspection_enabled = False
         self.proxy_healthy = False
@@ -258,6 +266,16 @@ class Controller:
         os.chmod(STAGE_DIR, 0o750)
         if self.proxy_uid is not None:
             os.chown(STAGE_DIR, self.proxy_uid, 0)
+        self.write_capture_filters()
+
+    def write_capture_filters(self):
+        if not CAPTURE_FILTERS_FILE.parent.is_dir():
+            return
+        filters = list(getattr(self, 'capture_filters', CAPTURE_CATEGORIES))
+        host_filter = str(getattr(self, 'capture_host_filter', '') or '')
+        skip_noise = bool(getattr(self, 'capture_skip_noise', False))
+        payload = {'categories': filters, 'host_filter': host_filter, 'skip_noise': skip_noise}
+        write(CAPTURE_FILTERS_FILE, json.dumps(payload) + '\n', 0o644)
 
     def _delete_flow_files(self, flow_id):
         sizes = getattr(self, 'flow_sizes', None)
@@ -305,7 +323,7 @@ class Controller:
             if state not in ('decrypted', 'passthrough', 'websocket', 'tcp', 'tls_failed', 'error'):
                 state = 'error'
             try:
-                status = max(0, min(999, int(raw.get('status', 0))))
+                status = max(0, min(4999, int(raw.get('status', 0))))
             except (TypeError, ValueError):
                 status = 0
             try:
@@ -324,6 +342,14 @@ class Controller:
                 server_port = max(0, min(65535, int(raw.get('server_port', 0))))
             except (TypeError, ValueError):
                 server_port = 0
+            payload_status = str(raw.get('payload_status', ''))
+            if payload_status not in ('complete', 'partial', 'streamed', 'empty'):
+                if raw.get('req_truncated') or raw.get('resp_truncated'):
+                    payload_status = 'partial'
+                elif req_bytes == 0 and byte_count == 0:
+                    payload_status = 'empty'
+                else:
+                    payload_status = 'complete'
             summary = {
                 'id': flow_id,
                 'time': str(raw.get('time', ''))[:32],
@@ -339,6 +365,7 @@ class Controller:
                 'content_type': str(raw.get('content_type', ''))[:48],
                 'req_bytes': req_bytes,
                 'bytes': byte_count,
+                'payload_status': payload_status,
                 'duration_ms': duration_ms,
                 'state': state,
                 'detail': str(raw.get('detail', ''))[:120],
@@ -535,6 +562,9 @@ class Controller:
             return {'csrf': record['csrf'], 'clients': clients, 'monitor': self.health,
                     'wan_connected': wan.read_text().strip() == '1', 'inspection': self.inspection_state(),
                     'inspected_clients': len(self.desired_inspected_ips()), 'flows': flows,
+                    'capture_filters': list(getattr(self, 'capture_filters', CAPTURE_CATEGORIES)),
+                    'capture_host_filter': str(getattr(self, 'capture_host_filter', '') or ''),
+                    'capture_skip_noise': bool(getattr(self, 'capture_skip_noise', False)),
                     'ssid': self.config['ap']['ssid'], 'ca': json.loads((PUBLIC / 'ca.json').read_text()),
                     'pending': self.pending}
         if action == 'logout':
@@ -554,6 +584,28 @@ class Controller:
             self.clear_flow_files()
             self.audit_event('flows_cleared')
             return {'ok': True}
+        if action == 'capture-filters':
+            raw_cats = data.get('categories')
+            if not isinstance(raw_cats, list) or not all(isinstance(c, str) for c in raw_cats):
+                raise Failure('Invalid capture filter list')
+            unknown = [c for c in raw_cats if c not in CAPTURE_CATEGORIES]
+            if unknown:
+                raise Failure('Invalid capture filter category')
+            host_filter = data.get('host_filter', getattr(self, 'capture_host_filter', ''))
+            if not isinstance(host_filter, str):
+                raise Failure('Invalid host filter')
+            skip_noise = data.get('skip_noise', getattr(self, 'capture_skip_noise', False))
+            if type(skip_noise) is not bool:
+                raise Failure('Invalid noise filter flag')
+            selected = set(raw_cats)
+            self.capture_filters = [c for c in CAPTURE_CATEGORIES if c in selected]
+            self.capture_host_filter = host_filter.strip()[:128]
+            self.capture_skip_noise = skip_noise
+            self.write_capture_filters()
+            self.audit_event('capture_filters_updated')
+            return {'ok': True, 'capture_filters': list(self.capture_filters),
+                    'capture_host_filter': self.capture_host_filter,
+                    'capture_skip_noise': self.capture_skip_noise}
         if action == 'inspection':
             enabled = data.get('enabled')
             if type(enabled) is not bool:

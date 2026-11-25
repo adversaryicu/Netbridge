@@ -22,6 +22,7 @@ class NetworkTests(unittest.TestCase):
 
     def test_firewall_includes_inspection_redirect_and_quic_block(self):
         rules = network.firewall(self.config, self.state)
+        self.assertIn('iifname "eth0" tcp dport 8080 counter drop', rules)
         self.assertIn('set inspected_v4', rules)
         self.assertIn('chain prerouting', rules)
         self.assertIn('ip saddr @inspected_v4 ip daddr != 192.168.50.1 ip daddr != @protected_v4 tcp dport != 53 counter redirect to :8080', rules)

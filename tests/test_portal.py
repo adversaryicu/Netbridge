@@ -148,16 +148,32 @@ class ControllerTests(unittest.TestCase):
 
 
 class ProxyAddonTests(unittest.TestCase):
-    def test_path_redaction_and_truncation(self):
-        redacted = proxy_addon.redact_path('/auth/callback?token=secret123&next=/home&api_key=abc&tab=1')
-        self.assertIn('token=[REDACTED]', redacted)
-        self.assertIn('api_key=[REDACTED]', redacted)
-        self.assertIn('tab=1', redacted)
-        self.assertNotIn('secret123', redacted)
-        self.assertNotIn('abc', redacted)
-        long_path = '/' + ('a' * 220)
-        self.assertEqual(160, len(proxy_addon.redact_path(long_path)))
-        self.assertTrue(proxy_addon.redact_path(long_path).endswith('...'))
+    def test_unredacted_path_and_headers_preserved(self):
+        addon = proxy_addon.NetBridgeAddon(background=False)
+        records = []
+        addon.emit_record = lambda meta, req_b=b'', resp_b=b'': records.append((meta, req_b, resp_b))
+        flow = SimpleNamespace(
+            client_conn=SimpleNamespace(peername=('192.168.50.105', 51234), tls=True, sni='example.com'),
+            server_conn=SimpleNamespace(address=('93.184.216.34', 443), tls=True),
+            request=SimpleNamespace(
+                method='GET', scheme='https', pretty_host='example.com', host='example.com',
+                path='/auth/callback?token=synthetic_tok&next=/home&api_key=synthetic_key&tab=1',
+                http_version='HTTP/2.0',
+                headers=[('host', 'example.com'), ('authorization', 'Bearer synthetic_bearer')],
+                raw_content=b'', timestamp_start=100.0,
+            ),
+            response=SimpleNamespace(
+                status_code=200, reason='OK', http_version='HTTP/2.0',
+                headers={'content-type': 'text/plain'},
+                raw_content=b'ok', timestamp_end=100.01,
+            ),
+        )
+        addon.response(flow)
+        self.assertEqual(1, len(records))
+        meta = records[0][0]
+        self.assertIn('token=synthetic_tok', meta['path'])
+        self.assertIn('api_key=synthetic_key', meta['path'])
+        self.assertIn(['authorization', 'Bearer synthetic_bearer'], meta['request_headers'])
 
     def test_addon_emits_http_tcp_websocket_and_tls_failed_events(self):
         addon = proxy_addon.NetBridgeAddon(background=False)
