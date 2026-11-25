@@ -3,7 +3,8 @@ schema_version = 1
 [ap]
 ssid = "NetBridge-Lab"
 channel = 6
-country = "US"
+# "auto" uses the device's configured Wi-Fi regulatory domain, or set a 2-letter ISO code (e.g. "US", "GB", "DE").
+country = "auto"
 client_isolation = true
 
 [lan]

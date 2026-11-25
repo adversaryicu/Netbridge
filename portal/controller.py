@@ -115,8 +115,9 @@ class Controller:
         return result['record'] if action=='hash' else result['valid']
 
     async def command(self, *args):
+        env = {**os.environ, 'LC_ALL': 'C'}
         process = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
-                                                        stderr=asyncio.subprocess.PIPE)
+                                                        stderr=asyncio.subprocess.PIPE, env=env)
         try:
             out, err = await asyncio.wait_for(process.communicate(), timeout=45)
         except asyncio.TimeoutError:

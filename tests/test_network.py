@@ -20,6 +20,28 @@ class NetworkTests(unittest.TestCase):
     def test_valid_defaults(self):
         network.validate(self.config)
 
+    def test_country_validation_and_reg_domain(self):
+        for valid in ('auto', 'US', 'GB', 'DE', 'JP'):
+            self.config['ap']['country'] = valid
+            network.validate(self.config)
+        for bad in ('00', 'USA', 'us', ''):
+            self.config['ap']['country'] = bad
+            with self.assertRaises(ValueError):
+                network.validate(self.config)
+        self.assertEqual('DE', network.check_reg_domain('auto', 'global\ncountry DE: DFS-ETSI\n'))
+        self.assertEqual('GB', network.check_reg_domain('GB', 'global\ncountry GB: DFS-ETSI\n'))
+        with self.assertRaises(RuntimeError):
+            network.check_reg_domain('auto', 'global\ncountry 00: DFS-UNSET\n')
+        with self.assertRaises(RuntimeError):
+            network.check_reg_domain('US', 'global\ncountry DE: DFS-ETSI\n')
+
+    def test_generate_passphrase_format(self):
+        import re
+        for _ in range(10):
+            pw = network.generate_passphrase()
+            self.assertRegex(pw, r'^[A-Z][a-z]+-[A-Z][a-z]+-\d{4}$')
+            self.assertTrue(8 <= len(pw) <= 63)
+
     def test_firewall_includes_inspection_redirect_and_quic_block(self):
         rules = network.firewall(self.config, self.state)
         self.assertIn('iifname "eth0" tcp dport 8080 counter drop', rules)

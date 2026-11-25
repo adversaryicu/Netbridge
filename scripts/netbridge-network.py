@@ -21,9 +21,30 @@ PROFILE = Path('/etc/NetworkManager/system-connections/netbridge-ap.nmconnection
 UNIT = Path('/etc/systemd/system/netbridge-ap.service')
 SELF = Path('/usr/local/lib/netbridge/netbridge-network.py')
 
+PASSPHRASE_WORDS = (
+    'Amber', 'Anchor', 'Arbor', 'Atlas', 'Badge', 'Basalt', 'Beacon', 'Birch',
+    'Bridge', 'Brook', 'Canyon', 'Cedar', 'Cipher', 'Cobalt', 'Comet', 'Copper',
+    'Coral', 'Crest', 'Crown', 'Delta', 'Drift', 'Ember', 'Falcon', 'Field',
+    'Flint', 'Forest', 'Forge', 'Frost', 'Gale', 'Granite', 'Harbor', 'Haven',
+    'Hazel', 'Horizon', 'Iron', 'Jasper', 'Juniper', 'Kestrel', 'Lantern', 'Larch',
+    'Linen', 'Maple', 'Meadow', 'Mesa', 'Moss', 'Oak', 'Onyx', 'Orchard',
+    'Otter', 'Peak', 'Pebble', 'Pine', 'Quartz', 'Raven', 'Ridge', 'River',
+    'Rowan', 'Signal', 'Slate', 'Spruce', 'Stone', 'Summit', 'Timber', 'Willow',
+)
+
+
+def generate_passphrase():
+    w1 = secrets.choice(PASSPHRASE_WORDS)
+    w2 = secrets.choice(PASSPHRASE_WORDS)
+    while w2 == w1:
+        w2 = secrets.choice(PASSPHRASE_WORDS)
+    num = secrets.randbelow(9000) + 1000
+    return f'{w1}-{w2}-{num}'
+
 
 def run(*args, check=True, data=None):
-    result = subprocess.run(args, input=data, text=True, capture_output=True, timeout=90)
+    env = {**os.environ, 'LC_ALL': 'C'}
+    result = subprocess.run(args, input=data, text=True, capture_output=True, timeout=90, env=env)
     if check and result.returncode:
         # Never include command arguments: a future caller might pass a secret.
         raise RuntimeError(f'{args[0]} failed: {result.stderr.strip()}')
@@ -51,8 +72,11 @@ def validate(config):
     ap, lan = config['ap'], config['lan']
     if not re.fullmatch(r'[A-Za-z0-9 _.-]{1,32}', ap['ssid']):
         raise ValueError('SSID must be 1-32 simple ASCII characters')
-    if ap['country'] != 'US' or ap['channel'] not in range(1, 12):
-        raise ValueError('Phase 1 currently validates US channels 1-11 only')
+    country = str(ap.get('country', ''))
+    if country != 'auto' and (not re.fullmatch(r'[A-Z]{2}', country) or country == '00'):
+        raise ValueError('AP country must be "auto" or a 2-letter ISO code (e.g. US, GB, DE)')
+    if ap['channel'] not in range(1, 12):
+        raise ValueError('NetBridge supports 2.4 GHz channels 1-11 only')
     if type(ap['client_isolation']) is not bool:
         raise ValueError('client_isolation must be boolean')
     address = ipaddress.IPv4Interface(lan['cidr'])
@@ -77,6 +101,18 @@ def load_config():
 
 def load_state():
     return json.loads(STATE.read_text())
+
+
+def check_reg_domain(country, reg_output):
+    match = re.search(r'country\s+([A-Z0-9]{2}):', reg_output or '')
+    active = match.group(1) if match else '00'
+    if country == 'auto':
+        if active == '00':
+            raise RuntimeError('Wi-Fi regulatory domain is unset (00); set your country first (e.g. sudo iw reg set US)')
+        return active
+    if f'country {country}:' not in (reg_output or ''):
+        raise RuntimeError(f'Expected Wi-Fi regulatory domain {country} (found {active}); configure the country first')
+    return country
 
 
 def check_conflicts(config, routes, lan_interface):
@@ -189,8 +225,7 @@ def install(source):
         wan = wan_candidates[0]
     if lan not in lan_candidates or wan not in wan_candidates or lan == wan:
         raise RuntimeError('Select one Wi-Fi LAN and one connected Ethernet WAN explicitly')
-    if 'country US:' not in run('iw', 'reg', 'get'):
-        raise RuntimeError('Expected existing US regulatory domain; configure the correct country first')
+    check_reg_domain(config['ap']['country'], run('iw', 'reg', 'get'))
     routes = json.loads(run('ip', '-j', '-4', 'route'))
     check_conflicts(config, routes, lan)
     if not any(r.get('dst') == 'default' and r.get('dev') == wan for r in routes):
@@ -212,7 +247,7 @@ def install(source):
     atomic_write(STATE, json.dumps(state, indent=2) + '\n')
     atomic_write(CONFIG, (source / 'config/phase1.toml').read_text())
     if not SECRET.exists():
-        atomic_write(SECRET, secrets.token_urlsafe(18) + '\n')
+        atomic_write(SECRET, generate_passphrase() + '\n')
     atomic_write(PROFILE, profile(config, state, SECRET.read_text().strip()))
     atomic_write(SELF, Path(__file__).read_text(), 0o755)
     atomic_write(UNIT, (source / 'systemd/netbridge-ap.service').read_text(), 0o644)

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="NetBridge local certificate onboarding, gateway administration, and traffic telemetry.">
+  <meta name="description" content="NetBridge portable Wi-Fi Network Tap, certificate onboarding, and traffic inspector.">
   <title>NetBridge // Adversary ICU</title>
   <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
 </head>
@@ -11,7 +11,7 @@
   <div class="site-shell site-header__inner">
     <div class="site-brand">
       <a href="/" class="site-brand__mark">NETBRIDGE // ADVERSARY ICU</a>
-      <p class="site-brand__descriptor">Field Gateway, Certificate Onboarding, and Traffic Telemetry</p>
+      <p class="site-brand__descriptor">Portable Network Tap, Certificate Onboarding, and Traffic Inspector</p>
       <p class="site-brand__meta">
         <span>NODE // <strong id="meta-gateway">192.168.50.1</strong></span>
         <span>INSPECTION // <strong id="meta-inspection" class="state-off">off</strong></span>
@@ -32,7 +32,7 @@
 
     <section id="setup" hidden>
       <header class="section-page-header">
-        <p class="entry-marker">Gateway Onboarding</p>
+        <p class="entry-marker">Tap Onboarding</p>
         <h1 class="article-title">Device Setup &amp; Certificate Trust</h1>
         <p class="article-dek">Install the device-local root CA on authorized test hardware, then verify HTTPS trust directly below.</p>
       </header>
@@ -132,7 +132,7 @@
     <section id="admin" hidden>
       <header class="section-page-header admin-header-bar">
         <div>
-          <p class="entry-marker">Gateway Administration</p>
+          <p class="entry-marker">Tap Administration</p>
           <h1 class="article-title">Node Telemetry &amp; Access Control</h1>
           <p class="article-dek">Authorize test clients, toggle transparent capture, and manage device credentials.</p>
         </div>
@@ -186,7 +186,7 @@
         <div class="section-heading section-heading--split">
           <div>
             <p class="section-heading__label">03</p>
-            <h2 class="section-heading__title">Gateway Configuration</h2>
+            <h2 class="section-heading__title">Tap Configuration</h2>
           </div>
           <p class="section-heading__utility">$ cat /etc/netbridge/phase1.toml</p>
         </div>
@@ -331,7 +331,7 @@
 
 <footer class="site-footer">
   <div class="site-shell site-footer__inner">
-    <p>NetBridge is a local authorized-test Wi-Fi gateway and traffic inspection node running on Cardputer Zero.</p>
+    <p>NetBridge is a local authorized-test Wi-Fi Network Tap running on Cardputer Zero.</p>
     <div class="site-footer__links">
       <a href="/">Setup</a>
       <a href="/admin" id="footer-admin">Admin</a>
