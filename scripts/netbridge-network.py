@@ -103,9 +103,26 @@ def load_state():
     return json.loads(STATE.read_text())
 
 
-def check_reg_domain(country, reg_output):
+def active_reg_domain(reg_output):
     match = re.search(r'country\s+([A-Z0-9]{2}):', reg_output or '')
-    active = match.group(1) if match else '00'
+    return match.group(1) if match else '00'
+
+
+def save_country(code):
+    code = str(code or '').strip().upper()
+    if not re.fullmatch(r'[A-Z]{2}', code) or code == '00':
+        raise ValueError('Country code must be 2 letters A-Z (not 00)')
+    run('iw', 'reg', 'set', code)
+    text = CONFIG.read_text()
+    updated, count = re.subn(r'^country\s*=.*$', f'country = "{code}"', text, count=1, flags=re.M)
+    if count != 1:
+        updated = text.rstrip() + f'\ncountry = "{code}"\n'
+    atomic_write(CONFIG, updated)
+    return code
+
+
+def check_reg_domain(country, reg_output):
+    active = active_reg_domain(reg_output)
     if country == 'auto':
         if active == '00':
             raise RuntimeError('Wi-Fi regulatory domain is unset (00); set your country first (e.g. sudo iw reg set US)')
@@ -225,7 +242,11 @@ def install(source):
         wan = wan_candidates[0]
     if lan not in lan_candidates or wan not in wan_candidates or lan == wan:
         raise RuntimeError('Select one Wi-Fi LAN and one connected Ethernet WAN explicitly')
-    check_reg_domain(config['ap']['country'], run('iw', 'reg', 'get'))
+    reg_out = run('iw', 'reg', 'get')
+    if config['ap']['country'] == 'auto' and active_reg_domain(reg_out) == '00':
+        print('Wi-Fi country is unset (00); NetBridge will prompt on the Cardputer screen on first launch.')
+    else:
+        check_reg_domain(config['ap']['country'], reg_out)
     routes = json.loads(run('ip', '-j', '-4', 'route'))
     check_conflicts(config, routes, lan)
     if not any(r.get('dst') == 'default' and r.get('dev') == wan for r in routes):

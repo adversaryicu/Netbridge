@@ -10,6 +10,11 @@ import subprocess
 import time
 
 ROOT = Path('/usr/local/lib/netbridge')
+KEY_LETTERS = {
+    16: 'Q', 17: 'W', 18: 'E', 19: 'R', 20: 'T', 21: 'Y', 22: 'U', 23: 'I', 24: 'O', 25: 'P',
+    30: 'A', 31: 'S', 32: 'D', 33: 'F', 34: 'G', 35: 'H', 36: 'J', 37: 'K', 38: 'L',
+    44: 'Z', 45: 'X', 46: 'C', 47: 'V', 48: 'B', 49: 'N', 50: 'M',
+}
 running = True
 
 
@@ -41,6 +46,8 @@ def main():
     try:
         buffer = b''
         ready = False
+        prompt_mode = None
+        country_code = ''
         session_data = None
         show_password = False
         deadline = time.monotonic() + 120
@@ -54,6 +61,22 @@ def main():
                     if kind == 1 and value == 1:
                         if code == 1:
                             stop()
+                        elif prompt_mode == 'country':
+                            if code in KEY_LETTERS and len(country_code) < 2:
+                                country_code += KEY_LETTERS[code]
+                                draw({'prompt': 'country', 'code': country_code})
+                            elif code == 14 and country_code:
+                                country_code = country_code[:-1]
+                                draw({'prompt': 'country', 'code': country_code})
+                            elif code == 28:
+                                if len(country_code) == 2 and country_code != '00':
+                                    proc.stdin.write((json.dumps({'country': country_code}) + '\n').encode())
+                                    proc.stdin.flush()
+                                    prompt_mode = None
+                                    deadline = time.monotonic() + 120
+                                    draw({'message': f'Setting country {country_code}...', 'detail': 'Starting Network Tap'})
+                                else:
+                                    draw({'prompt': 'country', 'code': country_code, 'error': 'Enter 2 letters (e.g. US, GB, DE)'})
                         elif code in (19, 6) and ready and session_data is not None:
                             show_password = not show_password
                             draw({**session_data, 'show_password': show_password})
@@ -64,15 +87,24 @@ def main():
                 buffer += chunk
                 if len(buffer) > 8192:
                     raise RuntimeError('Invalid session response')
-                if b'\n' in buffer and not ready:
-                    session_data = json.loads(buffer.split(b'\n')[0])
-                    draw({**session_data, 'show_password': show_password})
-                    ready = True
+                while b'\n' in buffer and not ready:
+                    line, buffer = buffer.split(b'\n', 1)
+                    if not line.strip():
+                        continue
+                    msg = json.loads(line)
+                    if msg.get('prompt') == 'country':
+                        prompt_mode = 'country'
+                        country_code = ''
+                        draw({'prompt': 'country', 'code': ''})
+                    else:
+                        session_data = msg
+                        draw({**session_data, 'show_password': show_password})
+                        ready = True
             if ready and time.monotonic() > heartbeat:
                 proc.stdin.write(b'alive\n')
                 proc.stdin.flush()
                 heartbeat = time.monotonic() + 3
-            if not ready and time.monotonic() > deadline:
+            if not ready and prompt_mode is None and time.monotonic() > deadline:
                 raise RuntimeError('Startup timed out')
         if running:
             draw({'message': 'Unable to run. See session log.', 'detail': 'Press ESC to return.'})

@@ -54,10 +54,21 @@ def serve():
     net.atomic_write(SNAPSHOT, json.dumps(state))
     # Keep the network script's failed-start recovery in sync with this launch.
     net.atomic_write(net.STATE, json.dumps(state))
+    config = net.load_config()
+    active_reg = net.active_reg_domain(command('iw', 'reg', 'get', check=False))
+    if config['ap']['country'] == 'auto' and active_reg == '00':
+        print(json.dumps({'prompt': 'country'}), flush=True)
+        raw_reply = sys.stdin.readline()
+        if not raw_reply:
+            raise RuntimeError('Wi-Fi country setup cancelled')
+        reply = json.loads(raw_reply)
+        net.save_country(reply.get('country', ''))
+        config = net.load_config()
+    elif config['ap']['country'] != 'auto' and active_reg != config['ap']['country']:
+        command('iw', 'reg', 'set', config['ap']['country'], check=False)
     command('systemctl', 'start', 'netbridge-ap.service')
     command('systemctl', 'start', 'netbridge-controller.service', 'netbridge-portal.service',
             'netbridge-certificate-renew.timer')
-    config = net.load_config()
     gateway = config['lan']['cidr'].split('/')[0]
     context = ssl.create_default_context(cafile='/var/lib/netbridge/portal-public/netbridge-ca.crt')
     deadline = time.monotonic() + 30

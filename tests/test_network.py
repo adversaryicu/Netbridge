@@ -35,6 +35,22 @@ class NetworkTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             network.check_reg_domain('US', 'global\ncountry DE: DFS-ETSI\n')
 
+    def test_save_country_persists_and_applies(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / 'phase1.toml'
+            cfg.write_text('[ap]\ncountry = "auto"\nchannel = 6\n')
+            calls = []
+            with patch.object(network, 'CONFIG', cfg), \
+                 patch.object(network, 'run', side_effect=lambda *a, **k: calls.append(a) or ''), \
+                 patch.object(network, 'atomic_write', side_effect=lambda p, d, *a: p.write_text(d)):
+                self.assertEqual('GB', network.save_country('gb'))
+                self.assertIn(('iw', 'reg', 'set', 'GB'), calls)
+                self.assertIn('country = "GB"', cfg.read_text())
+                for bad in ('00', 'USA', '12', ''):
+                    with self.assertRaises(ValueError):
+                        network.save_country(bad)
+
     def test_generate_passphrase_format(self):
         import re
         for _ in range(10):

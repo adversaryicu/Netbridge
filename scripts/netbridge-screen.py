@@ -88,8 +88,11 @@ def render(data):
     text(11, 6, 'NETBRIDGE // TAP', 14, TEXT, 200, bold=True)
 
     is_msg = 'message' in data
+    is_country = data.get('prompt') == 'country'
     msg_lower = str(data.get('message', '')).lower()
-    if is_msg:
+    if is_country:
+        badge, b_bg, b_fg, b_bd = 'SETUP', '#19222D', '#9BB4CE', '#2E4054'
+    elif is_msg:
         if 'unable' in msg_lower or 'fail' in msg_lower or 'error' in msg_lower:
             badge, b_bg, b_fg, b_bd = 'ERR', WARN_BG, WARN_FG, WARN_BORDER
         elif 'stop' in msg_lower:
@@ -107,7 +110,20 @@ def render(data):
     # Main content panel
     draw.rectangle((8, 34, 311, 141), fill=SURFACE, outline=BORDER)
 
-    if is_msg:
+    if is_country:
+        code = str(data.get('code', '') or '').upper()[:2]
+        text(18, 43, 'Set Wi-Fi Country Code', 14, TEXT, 284, bold=True)
+        text(18, 63, 'Type 2-letter ISO code (e.g. US, GB, DE)', 11, TEXT_MUTED, 284)
+        for idx, bx in enumerate((110, 166)):
+            ch = code[idx] if idx < len(code) else '_'
+            active_slot = idx == len(code) or (len(code) == 2 and idx == 1)
+            bd = LIVE_BORDER if len(code) == 2 else (ACCENT_RED if active_slot else BORDER)
+            fg = LIVE_FG if len(code) == 2 else (TEXT if idx < len(code) else TEXT_MUTED)
+            draw.rectangle((bx, 83, bx + 40, 118), fill=RAISED, outline=bd)
+            text(bx + 13, 91, ch, 18, fg, 24, bold=True)
+        if data.get('error'):
+            text(18, 123, data['error'], 11, WARN_FG, 284)
+    elif is_msg:
         text(18, 62, data['message'], 15, TEXT, 284, bold=True)
         text(18, 92, data.get('detail', 'Please wait…'), 12, TEXT_MUTED, 284)
     else:
@@ -132,10 +148,14 @@ def render(data):
     # Footer keybar
     draw.rectangle((0, 146, 319, 169), fill=RAISED)
     draw.rectangle((0, 146, 319, 146), fill=BORDER)
-    if not is_msg:
-        toggle_label = '[R/5] HIDE PASS' if data.get('show_password', False) else '[R/5] SHOW PASS'
-        text(10, 151, toggle_label, 11, TEXT_SEC, 160, bold=True)
-    text(204, 151, '[ESC] STOP TAP', 11, ACCENT_RED, 110, bold=True)
+    if is_country:
+        text(10, 151, '[A-Z] TYPE   [ENT] SAVE', 11, TEXT_SEC, 190, bold=True)
+        text(228, 151, '[ESC] EXIT', 11, ACCENT_RED, 86, bold=True)
+    else:
+        if not is_msg:
+            toggle_label = '[R/5] HIDE PASS' if data.get('show_password', False) else '[R/5] SHOW PASS'
+            text(10, 151, toggle_label, 11, TEXT_SEC, 160, bold=True)
+        text(204, 151, '[ESC] STOP TAP', 11, ACCENT_RED, 110, bold=True)
     return image
 
 
