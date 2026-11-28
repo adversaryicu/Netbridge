@@ -5,9 +5,205 @@ let inspectionState = 'off', lastFlows = [], lastClients = [];
 let selectedFlowId = null, selectedDetail = null, activeTab = 'response';
 let viewMode = { request: 'auto', response: 'auto' };
 let flowsPaused = false, pollBusy = false, filterSaveBusy = false;
-let pendingExportUrl = null, deepSearchMatchMap = null;
+let pendingExportUrl = null, pendingExportMeta = null, deepSearchMatchMap = null;
 const INSPECTOR_CACHE_KEY = 'netbridge.inspector.cache.v1';
 let flowDetailCache = new Map();
+
+// Ephemeral RAM-key AES-256-GCM Encrypted Browser Archive (IndexedDB)
+const ARCHIVE_DB_NAME = 'netbridge_ephemeral_archive_v1';
+const ARCHIVE_STORE = 'details';
+let archiveEnabled = false;
+let archiveDb = null;
+let archiveKey = null;
+let archiveIvSalt = null;
+let archiveIvCounter = 0;
+let archiveCaFingerprint = '';
+let archiveHighWaterId = 0;
+let archiveCount = 0;
+let archiveBytes = 0;
+let archiveSyncBusy = false;
+let archivedSummaries = new Map();
+
+function purgeOrphanedArchiveDb() {
+  try {
+    if (window.indexedDB) indexedDB.deleteDatabase(ARCHIVE_DB_NAME);
+  } catch (_) {}
+}
+function openArchiveDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(ARCHIVE_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(ARCHIVE_STORE)) {
+        db.createObjectStore(ARCHIVE_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+  });
+}
+function nextArchiveIv() {
+  const iv = new Uint8Array(12);
+  iv.set(archiveIvSalt, 0);
+  archiveIvCounter += 1;
+  let c = archiveIvCounter;
+  for (let i = 11; i >= 4; i -= 1) {
+    iv[i] = c & 0xff;
+    c = Math.floor(c / 256);
+  }
+  return iv;
+}
+async function archivePutDetail(detail) {
+  if (!archiveDb || !archiveKey || !detail || !detail.flow) return;
+  const plain = new TextEncoder().encode(JSON.stringify(detail));
+  const iv = nextArchiveIv();
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, archiveKey, plain);
+  const record = { id: detail.flow.id, iv: Array.from(iv), ct, approxBytes: plain.byteLength };
+  await new Promise((resolve, reject) => {
+    const tx = archiveDb.transaction(ARCHIVE_STORE, 'readwrite');
+    tx.objectStore(ARCHIVE_STORE).put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('IndexedDB write failed'));
+  });
+  if (!archivedSummaries.has(detail.flow.id)) {
+    archiveCount += 1;
+    archiveBytes += plain.byteLength;
+  }
+  archivedSummaries.set(detail.flow.id, detail.flow);
+}
+async function archiveGetDetail(flowId) {
+  if (!archiveDb || !archiveKey || !archivedSummaries.has(flowId)) return null;
+  const rec = await new Promise((resolve, reject) => {
+    const tx = archiveDb.transaction(ARCHIVE_STORE, 'readonly');
+    const req = tx.objectStore(ARCHIVE_STORE).get(flowId);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+  if (!rec) return null;
+  const plain = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(rec.iv) },
+    archiveKey,
+    rec.ct
+  );
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+async function archiveGetAllDetails() {
+  if (!archiveDb || !archiveKey || archiveCount === 0) return [];
+  const recs = await new Promise((resolve, reject) => {
+    const tx = archiveDb.transaction(ARCHIVE_STORE, 'readonly');
+    const req = tx.objectStore(ARCHIVE_STORE).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+  recs.sort((a, b) => a.id - b.id);
+  const dec = new TextDecoder();
+  const out = [];
+  for (const rec of recs) {
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: new Uint8Array(rec.iv) },
+      archiveKey,
+      rec.ct
+    );
+    out.push(JSON.parse(dec.decode(plain)));
+  }
+  return out;
+}
+function updateArchiveBanner() {
+  const banner = $('archive-banner');
+  const text = $('archive-banner-text');
+  const btn = $('toggle-browser-archive');
+  if (btn) {
+    btn.textContent = archiveEnabled ? `Browser Archive: On (${archiveCount})` : (archiveCount > 0 ? `Browser Archive: Paused (${archiveCount})` : 'Browser Archive: Off');
+    btn.className = archiveEnabled ? 'primary' : 'quiet';
+  }
+  if (!banner || !text) return;
+  if (!archiveEnabled && archiveCount === 0) {
+    banner.hidden = true;
+    return;
+  }
+  banner.hidden = false;
+  if (archiveCount > 0) {
+    text.textContent = `Potentially unredacted/sensitive data (${archiveCount} flow${archiveCount === 1 ? '' : 's'}, ~${formatBytes(archiveBytes)}) is stored in this tab's RAM-key AES-256-GCM IndexedDB. Export or clear it before closing this tab.`;
+  } else {
+    text.textContent = 'Encrypted Browser Archive is active (RAM-only AES-256-GCM key). Captured flows will be stored in this tab until cleared or closed.';
+  }
+}
+async function clearBrowserArchive(silent = false) {
+  archiveEnabled = false;
+  archiveKey = null;
+  archiveIvSalt = null;
+  archiveIvCounter = 0;
+  archiveHighWaterId = 0;
+  archiveCount = 0;
+  archiveBytes = 0;
+  archivedSummaries.clear();
+  if (archiveDb) {
+    try { archiveDb.close(); } catch (_) {}
+    archiveDb = null;
+  }
+  purgeOrphanedArchiveDb();
+  updateArchiveBanner();
+  if ($('inspector') && !$('inspector').hidden) renderFlows();
+  if (!silent) notice('Cleared encrypted browser archive and dropped RAM encryption key.');
+}
+async function toggleBrowserArchive() {
+  if (archiveEnabled) {
+    archiveEnabled = false;
+    updateArchiveBanner();
+    notice(`Browser Archive paused (${archiveCount} flow${archiveCount === 1 ? '' : 's'} retained in this tab).`);
+    return;
+  }
+  if (!window.crypto || !window.crypto.subtle || !window.indexedDB) {
+    notice('WebCrypto AES-GCM and IndexedDB require a modern browser over HTTPS.', true);
+    return;
+  }
+  try {
+    if (!archiveKey) {
+      archiveKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+      archiveIvSalt = crypto.getRandomValues(new Uint8Array(4));
+      archiveIvCounter = 0;
+    }
+    if (!archiveDb) {
+      archiveDb = await openArchiveDb();
+    }
+    archiveEnabled = true;
+    updateArchiveBanner();
+    await syncBrowserArchive();
+    notice('Encrypted Browser Archive enabled (RAM-only AES-256-GCM key).');
+  } catch (error) {
+    archiveEnabled = false;
+    updateArchiveBanner();
+    notice(error.message || 'Unable to initialize Encrypted Browser Archive', true);
+  }
+}
+async function syncBrowserArchive() {
+  if (!archiveEnabled || archiveSyncBusy || !archiveKey || !archiveDb) return;
+  archiveSyncBusy = true;
+  try {
+    for (let batch = 0; batch < 2; batch += 1) {
+      const res = await api(`flows-since?after_id=${encodeURIComponent(archiveHighWaterId)}&limit=10`);
+      const items = res.items || [];
+      for (const detail of items) {
+        await archivePutDetail(detail);
+      }
+      if (typeof res.next_after_id === 'number' && res.next_after_id > archiveHighWaterId) {
+        archiveHighWaterId = res.next_after_id;
+      }
+      if (!res.has_more || !items.length) break;
+    }
+    updateArchiveBanner();
+  } catch (_) {
+    // Non-fatal: next poll will retry
+  } finally {
+    archiveSyncBusy = false;
+  }
+}
+function mergedFlows() {
+  if (archiveCount === 0) return lastFlows;
+  const byId = new Map(archivedSummaries);
+  for (const f of lastFlows) byId.set(f.id, f);
+  return Array.from(byId.values()).sort((a, b) => b.id - a.id);
+}
 
 function saveInspectorCache() {
   try {
@@ -177,7 +373,7 @@ function updateClientFilterOptions() {
   const current = select.value;
   const seen = new Map();
   for (const c of lastClients) { if (c.ip) seen.set(c.ip, `${c.name} (${c.ip})`); }
-  for (const f of lastFlows) { if (f.client_ip && !seen.has(f.client_ip)) seen.set(f.client_ip, f.client_ip); }
+  for (const f of mergedFlows()) { if (f.client_ip && !seen.has(f.client_ip)) seen.set(f.client_ip, f.client_ip); }
   const first = document.createElement('option'); first.value = ''; first.textContent = 'All clients';
   const options = [first];
   for (const [ip, label] of seen.entries()) {
@@ -207,11 +403,12 @@ function matchesFilter(f) {
 }
 function renderFlows() {
   const container = $('flows');
-  const filtered = lastFlows.filter(matchesFilter);
+  const allFlows = mergedFlows();
+  const filtered = allFlows.filter(matchesFilter);
   container.replaceChildren();
   if (!filtered.length) {
     const p = document.createElement('p'); p.className = 'empty';
-    p.textContent = lastFlows.length ? 'No captured flows match the active filters.' : (inspectionState === 'on' ? 'Inspection active. Waiting for HTTP, HTTPS, WebSocket, or application TCP traffic…' : 'No traffic recorded. Enable inspection and approve a trusted device to capture flows.');
+    p.textContent = allFlows.length ? 'No captured flows match the active filters.' : (inspectionState === 'on' ? 'Inspection active. Waiting for HTTP, HTTPS, WebSocket, or application TCP traffic…' : 'No traffic recorded. Enable inspection and approve a trusted device to capture flows.');
     container.append(p); return;
   }
   for (const f of filtered) {
@@ -245,6 +442,12 @@ async function selectFlow(flowId) {
   $('inspector-subtitle').textContent = '';
   $('inspector-body').replaceChildren();
   try {
+    const archived = await archiveGetDetail(flowId);
+    if (archived) {
+      selectedDetail = archived;
+      renderInspector();
+      return;
+    }
     selectedDetail = await api(`flow?id=${encodeURIComponent(flowId)}`);
     flowDetailCache.set(flowId, selectedDetail);
     saveInspectorCache();
@@ -256,7 +459,7 @@ async function selectFlow(flowId) {
       notice(`Offline — showing browser-cached details for flow #${flowId}.`, true);
       return;
     }
-    const summary = lastFlows.find(f => f.id === flowId);
+    const summary = mergedFlows().find(f => f.id === flowId);
     if (summary) {
       selectedDetail = {
         flow: summary,
@@ -496,6 +699,7 @@ function scheduleRefresh() {
   if ($('admin').hidden && $('inspector').hidden) return;
   refreshTimer = setTimeout(() => refreshProtected().catch(error => {
     if (error.status === 401) {
+      clearBrowserArchive(true);
       showView('authentication');
       notice('Session expired. Sign in again.');
     } else if (isInspectorPage && lastFlows.length) {
@@ -516,11 +720,21 @@ async function refreshProtected() {
   pollBusy = true;
   try {
     const state = await api('status');
+    if (state.ca && state.ca.fingerprint) {
+      if (archiveCaFingerprint && archiveCaFingerprint !== state.ca.fingerprint && archiveCount > 0) {
+        await clearBrowserArchive(true);
+      }
+      archiveCaFingerprint = state.ca.fingerprint;
+    }
     setInspectionState(state.inspection, state.proxy_health);
     const wanText = state.wan_connected ? 'connected' : 'offline';
     $('meta-wan').textContent = wanText;
     lastClients = state.clients || [];
     if (!flowsPaused) lastFlows = state.flows || [];
+    if (archiveEnabled && !flowsPaused) {
+      await syncBrowserArchive();
+    }
+    updateArchiveBanner();
 
     if (isInspectorPage) {
       showView('inspector');
@@ -534,7 +748,9 @@ async function refreshProtected() {
           $('ingest-host').value = state.capture_host_filter || '';
         }
       }
-      $('hb-flows').textContent = `${lastFlows.length} / 100`;
+      $('hb-flows').textContent = archiveCount > 0
+        ? `${lastFlows.length} / 100 (${archiveCount} archived)`
+        : `${lastFlows.length} / 100`;
       if ($('hb-loss') && state.capture_stats) {
         const cs = state.capture_stats;
         const lost = cs.total_loss || 0;
@@ -651,6 +867,7 @@ async function signOut() {
     await api('logout', {});
     clearTimeout(refreshTimer);
     clearInspectorCache();
+    await clearBrowserArchive(true);
     showView('authentication');
     notice('Signed out.');
   } catch (error) {
@@ -658,6 +875,7 @@ async function signOut() {
   }
 }
 async function init() {
+  purgeOrphanedArchiveDb();
   $('nav-admin').href = `${httpsBase}/admin`;
   $('nav-inspector').href = `${httpsBase}/inspector`;
   $('footer-admin').href = `${httpsBase}/admin`;
@@ -752,6 +970,103 @@ busy($('rotate-form'), async () => {
   setTimeout(() => { location.href = `http://${location.hostname}/`; }, 5000);
 });
 
+function sanitizeCsvCellClient(val) {
+  if (typeof val !== 'string' || !val) return val;
+  if ('=+-@\t\r'.includes(val[0]) || /^[ \t\r\n]*[=+\-@]/.test(val)) return `'${val}`;
+  return val;
+}
+function csvEscapeClient(val) {
+  const s = String(val ?? '');
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+async function downloadBrowserArchiveExport(meta) {
+  const details = await archiveGetAllDetails();
+  if (!details.length) {
+    triggerExportDownload(meta.url);
+    return;
+  }
+  let content = '', mime = 'application/octet-stream', filename = 'netbridge-capture.jsonl';
+  if (meta.format === 'csv') {
+    const header = ['id', 'time', 'client_ip', 'server_ip', 'server_port', 'method', 'scheme', 'host', 'path', 'status', 'content_type', 'req_bytes', 'resp_bytes', 'duration_ms', 'state', 'detail', 'payload_status'];
+    const lines = [header.join(',')];
+    for (const d of details) {
+      const m = d.flow;
+      let row = [m.id, m.time || '', m.client_ip || '', m.server_ip || '', m.server_port || 0, m.method || '', m.scheme || '', m.host || '', m.path || '', m.status || 0, m.content_type || '', m.req_bytes || 0, m.bytes || 0, m.duration_ms || 0, m.state || '', m.detail || '', m.payload_status || ''];
+      if (meta.safeCsv) row = row.map(v => typeof v === 'string' ? sanitizeCsvCellClient(v) : v);
+      lines.push(row.map(csvEscapeClient).join(','));
+    }
+    content = lines.join('\r\n') + '\r\n';
+    mime = 'text/csv; charset=utf-8';
+    filename = meta.safeCsv ? 'netbridge-capture-safe.csv' : 'netbridge-capture.csv';
+  } else if (meta.format === 'jsonl') {
+    const lines = [JSON.stringify({ _netbridge_meta: true, source: 'browser_archive', exported_at: new Date().toISOString(), count: details.length })];
+    for (const d of details) {
+      const rec = { ...d.flow };
+      if (d.request && d.request.text) rec.request_text = d.request.text;
+      if (d.response && d.response.text) rec.response_text = d.response.text;
+      lines.push(JSON.stringify(rec));
+    }
+    content = lines.join('\n') + '\n';
+    mime = 'application/x-ndjson; charset=utf-8';
+    filename = 'netbridge-capture-archive.jsonl';
+  } else if (meta.format === 'har') {
+    const entries = [];
+    let skipped = 0;
+    for (const d of details) {
+      const m = d.flow;
+      const scheme = (m.scheme || 'http').toLowerCase();
+      if ((m.state !== 'decrypted' && m.state !== 'passthrough') || (scheme !== 'http' && scheme !== 'https')) {
+        skipped += 1;
+        continue;
+      }
+      const defPort = scheme === 'https' ? 443 : 80;
+      const portPart = m.server_port && m.server_port !== defPort ? `:${m.server_port}` : '';
+      const url = m.host ? `${scheme}://${m.host}${portPart}${m.path || '/'}` : (m.path || '/');
+      entries.push({
+        startedDateTime: m.time || '',
+        time: m.duration_ms || 0,
+        request: {
+          method: m.method || 'GET',
+          url,
+          httpVersion: m.http_version || 'HTTP/1.1',
+          headers: (m.request_headers || []).map(([name, value]) => ({ name, value })),
+          queryString: [],
+          cookies: [],
+          headersSize: -1,
+          bodySize: m.req_bytes || 0,
+          ...(d.request && d.request.text ? { postData: { mimeType: m.req_content_type || 'text/plain', text: d.request.text } } : {}),
+        },
+        response: {
+          status: m.status || 0,
+          statusText: m.reason || '',
+          httpVersion: m.resp_http_version || 'HTTP/1.1',
+          headers: (m.response_headers || []).map(([name, value]) => ({ name, value })),
+          cookies: [],
+          content: { size: m.bytes || 0, mimeType: m.content_type || 'application/octet-stream', ...(d.response && d.response.text ? { text: d.response.text } : {}) },
+          redirectURL: '',
+          headersSize: -1,
+          bodySize: m.bytes || 0,
+        },
+        cache: {},
+        timings: { blocked: -1, dns: -1, connect: -1, ssl: -1, send: -1, wait: m.duration_ms || 0, receive: -1 },
+        serverIPAddress: m.server_ip || '',
+        _netbridge: { flow_id: m.id, state: m.state, payload_status: m.payload_status || '' },
+      });
+    }
+    content = JSON.stringify({ log: { version: '1.2', creator: { name: 'NetBridge', version: '1.0' }, entries, _netbridge: { source: 'browser_archive', included_entries: entries.length, skipped_non_http: skipped } } }, null, 2);
+    mime = 'application/json; charset=utf-8';
+    filename = 'netbridge-capture-archive.har';
+  }
+  const blob = new Blob([content], { type: mime });
+  const objUrl = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = objUrl;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+}
 function triggerExportDownload(url) {
   const sep = url.includes('?') ? '&' : '?';
   const confirmedUrl = url.includes('confirm=') ? url : `${url}${sep}confirm=unredacted`;
@@ -762,19 +1077,22 @@ function triggerExportDownload(url) {
   link.click();
   link.remove();
 }
-function requestExportConfirmation(url, label) {
+function requestExportConfirmation(url, label, archiveMeta = null) {
   const dialog = $('export-confirm-dialog');
   const extra = label === 'CSV (Raw)'
     ? ' Raw CSV preserves untrusted cell values verbatim without spreadsheet formula escaping.'
     : '';
+  const scopeNote = archiveMeta && archiveCount > 0 ? ` (Browser Archive: ${archiveCount} flows)` : '';
   if (!dialog || typeof dialog.showModal !== 'function') {
-    if (confirm(`Plain-text export warning: ${label} exports are unredacted and can expose sensitive information such as tokens, cookies, or credentials.${extra} Continue?`)) {
-      triggerExportDownload(url);
+    if (confirm(`Plain-text export warning: ${label}${scopeNote} exports are unredacted and can expose sensitive information such as tokens, cookies, or credentials.${extra} Continue?`)) {
+      if (archiveMeta && archiveCount > 0) downloadBrowserArchiveExport(archiveMeta);
+      else triggerExportDownload(url);
     }
     return;
   }
   pendingExportUrl = url;
-  $('export-confirm-title').textContent = `Export unredacted ${label}?`;
+  pendingExportMeta = archiveMeta && archiveCount > 0 ? archiveMeta : null;
+  $('export-confirm-title').textContent = `Export unredacted ${label}${scopeNote}?`;
   $('export-confirm-proceed').textContent = `Export ${label}`;
   if ($('export-confirm-copy')) {
     $('export-confirm-copy').textContent = `NetBridge logs are unredacted plain text. Exporting can expose sensitive information such as authentication tokens, session cookies, API keys, passwords, or private payloads.${extra} Confirm that you want to download this file.`;
@@ -784,35 +1102,53 @@ function requestExportConfirmation(url, label) {
 
 $('admin-toggle-inspection').addEventListener('click', () => toggleInspection($('admin-toggle-inspection')));
 $('inspector-toggle-inspection').addEventListener('click', () => toggleInspection($('inspector-toggle-inspection')));
-for (const [id, label] of [['export-jsonl', 'JSONL'], ['export-har', 'HAR'], ['export-csv-safe', 'CSV (Safe)'], ['export-csv', 'CSV (Raw)']]) {
+if ($('toggle-browser-archive')) $('toggle-browser-archive').addEventListener('click', toggleBrowserArchive);
+if ($('archive-clear-btn')) $('archive-clear-btn').addEventListener('click', () => clearBrowserArchive(false));
+window.addEventListener('beforeunload', event => {
+  if (archiveCount > 0) {
+    event.preventDefault();
+    event.returnValue = '';
+  }
+});
+for (const [id, label, fmt, safeCsv] of [
+  ['export-jsonl', 'JSONL', 'jsonl', false],
+  ['export-har', 'HAR', 'har', false],
+  ['export-csv-safe', 'CSV (Safe)', 'csv', true],
+  ['export-csv', 'CSV (Raw)', 'csv', false],
+]) {
   const el = $(id);
   if (el) {
     el.addEventListener('click', event => {
       event.preventDefault();
-      requestExportConfirmation(el.href, label);
+      requestExportConfirmation(el.href, label, { url: el.href, format: fmt, safeCsv });
     });
   }
 }
 if ($('export-confirm-cancel')) {
   $('export-confirm-cancel').addEventListener('click', () => {
     pendingExportUrl = null;
+    pendingExportMeta = null;
     $('export-confirm-dialog').close();
   });
 }
 if ($('export-confirm-proceed')) {
   $('export-confirm-proceed').addEventListener('click', () => {
     const url = pendingExportUrl;
+    const meta = pendingExportMeta;
     pendingExportUrl = null;
+    pendingExportMeta = null;
     $('export-confirm-dialog').close();
-    if (url) triggerExportDownload(url);
+    if (meta) downloadBrowserArchiveExport(meta).catch(err => notice(err.message, true));
+    else if (url) triggerExportDownload(url);
   });
 }
 if ($('export-confirm-dialog')) {
   const dialog = $('export-confirm-dialog');
-  dialog.addEventListener('cancel', () => { pendingExportUrl = null; });
+  dialog.addEventListener('cancel', () => { pendingExportUrl = null; pendingExportMeta = null; });
   dialog.addEventListener('click', event => {
     if (event.target === dialog) {
       pendingExportUrl = null;
+      pendingExportMeta = null;
       dialog.close();
     }
   });
@@ -829,6 +1165,7 @@ $('clear-flows').addEventListener('click', async () => {
     await api('flows-clear', {});
     lastFlows = []; selectedFlowId = null; selectedDetail = null;
     clearInspectorCache();
+    await clearBrowserArchive(true);
     clearDeepSearch(false);
     $('inspector-content').hidden = true; $('inspector-empty').hidden = false;
     $('hb-flows').textContent = '0 / 100';
@@ -921,10 +1258,25 @@ async function runDeepSearch() {
   const btn = $('deep-search-btn');
   if (btn) btn.disabled = true;
   try {
-    const result = await api(`flows-search?q=${encodeURIComponent(q)}`);
     const map = new Map();
+    if (archiveCount > 0) {
+      const needle = q.toLowerCase();
+      const details = await archiveGetAllDetails();
+      for (const d of details) {
+        const m = d.flow || {};
+        const where = [];
+        const urlBlob = `${m.method || ''} ${m.scheme || ''} ${m.host || ''} ${m.path || ''} ${m.detail || ''} ${m.server_ip || ''}`.toLowerCase();
+        if (urlBlob.includes(needle)) where.push('url');
+        if ((m.request_headers || []).some(([k, v]) => `${k} ${v}`.toLowerCase().includes(needle))) where.push('req_header');
+        if ((m.response_headers || []).some(([k, v]) => `${k} ${v}`.toLowerCase().includes(needle))) where.push('resp_header');
+        if (d.request && d.request.text && d.request.text.toLowerCase().includes(needle)) where.push('req_body');
+        if (d.response && d.response.text && d.response.text.toLowerCase().includes(needle)) where.push('resp_body');
+        if (where.length) map.set(m.id, where);
+      }
+    }
+    const result = await api(`flows-search?q=${encodeURIComponent(q)}`);
     for (const m of (result.matches || [])) {
-      map.set(m.id, m.where || []);
+      if (!map.has(m.id)) map.set(m.id, m.where || []);
     }
     deepSearchMatchMap = map;
     if ($('deep-search-clear')) $('deep-search-clear').hidden = false;

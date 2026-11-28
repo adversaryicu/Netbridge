@@ -528,6 +528,43 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(100, count)
             self.assertLess(peak, 4 * 1024 * 1024)
 
+    async def test_flows_since_incremental_pagination_and_auth(self):
+        import h11
+        with tempfile.TemporaryDirectory() as td:
+            flows_dir = Path(td)
+            for i in range(1, 6):
+                (flows_dir / f'{i}.json').write_text(json.dumps({
+                    'id': i, 'time': f'2026-11-28T10:00:0{i}Z', 'client_ip': '192.168.50.100',
+                    'server_ip': '93.184.216.34', 'server_port': 443, 'method': 'GET',
+                    'scheme': 'https', 'host': f's{i}.example', 'path': '/',
+                    'status': 200, 'state': 'decrypted', 'content_type': 'text/plain',
+                    'req_bytes': 0, 'bytes': 2,
+                }))
+            with patch.object(server, 'FLOWS_DIR', flows_dir), \
+                 patch.object(server, 'rpc', new=AsyncMock(return_value={'status': 200, 'data': {'ok': True, 'ids': [1, 2, 3, 4, 5]}})):
+                ev1 = h11.Request(method=b'GET', target=b'/api/flows-since?after_id=1&limit=2',
+                                  headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
+                r1 = await self.portal.route(server.Request(ev1, b'', '192.168.50.100', True))
+                self.assertEqual(200, r1.status)
+                d1 = json.loads(r1.body)
+                self.assertEqual([2, 3], [x['flow']['id'] for x in d1['items']])
+                self.assertEqual(3, d1['next_after_id'])
+                self.assertTrue(d1['has_more'])
+
+                ev2 = h11.Request(method=b'GET', target=b'/api/flows-since?after_id=3&limit=5',
+                                  headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
+                r2 = await self.portal.route(server.Request(ev2, b'', '192.168.50.100', True))
+                d2 = json.loads(r2.body)
+                self.assertEqual([4, 5], [x['flow']['id'] for x in d2['items']])
+                self.assertEqual(5, d2['next_after_id'])
+                self.assertFalse(d2['has_more'])
+
+            with patch.object(server, 'rpc', new=AsyncMock(return_value={'status': 401, 'data': {'error': 'Sign in'}})):
+                ev_unauth = h11.Request(method=b'GET', target=b'/api/flows-since?after_id=0',
+                                        headers=[(b'host', b'192.168.50.1')])
+                r_unauth = await self.portal.route(server.Request(ev_unauth, b'', '192.168.50.100', True))
+                self.assertEqual(401, r_unauth.status)
+
 
 class AdministrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_pair_login_approve_logout_and_no_implicit_trust(self):

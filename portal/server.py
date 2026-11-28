@@ -163,6 +163,37 @@ def build_flow_detail(flow_id, flows_dir=None):
     }
 
 
+def build_flows_since(after_id, ids, limit=10, max_bytes=1048576, flows_dir=None):
+    flows_dir = flows_dir or FLOWS_DIR
+    limit = max(1, min(20, int(limit)))
+    pending_ids = sorted(fid for fid in ids if fid > after_id)
+    items = []
+    approx_bytes = 0
+    last_id = after_id
+    for fid in pending_ids:
+        if len(items) >= limit:
+            break
+        try:
+            detail = build_flow_detail(fid, flows_dir)
+        except Reject:
+            last_id = fid
+            continue
+        est = (
+            len(detail['request'].get('text', ''))
+            + len(detail['request'].get('hex', ''))
+            + len(detail['response'].get('text', ''))
+            + len(detail['response'].get('hex', ''))
+            + 2048
+        )
+        if items and approx_bytes + est > max_bytes:
+            break
+        items.append(detail)
+        approx_bytes += est
+        last_id = fid
+    has_more = any(fid > last_id for fid in pending_ids)
+    return {'items': items, 'next_after_id': last_id, 'has_more': has_more}
+
+
 def sanitize_csv_cell(value):
     if not isinstance(value, str) or not value:
         return value
@@ -504,7 +535,7 @@ class Portal:
                     pass
             return Response(body=pem, content_type='application/x-x509-ca-cert',
                             headers={'Content-Disposition':'attachment; filename="NetBridge-CA.crt"'})
-        reads = {'public', 'status', 'trust-probe', 'flow', 'flow-raw', 'flows-export', 'flows-search'}
+        reads = {'public', 'status', 'trust-probe', 'flow', 'flow-raw', 'flows-export', 'flows-search', 'flows-since'}
         writes = {'pair', 'login', 'logout', 'trust-confirm', 'approve', 'revoke',
                   'admin-password', 'rotate-ca', 'ap-settings', 'inspection', 'flows-clear',
                   'capture-filters'}
@@ -526,12 +557,19 @@ class Portal:
         except CookieError:
             raise Reject(400, 'Invalid cookie')
         session = cookies[COOKIE].value if COOKIE in cookies else ''
-        if action in ('flow', 'flow-raw', 'flows-export', 'flows-search'):
+        if action in ('flow', 'flow-raw', 'flows-export', 'flows-search', 'flows-since'):
             auth = await rpc({'action': 'flow-index', 'ip': request.remote, 'secure': request.secure,
                               'session': session, 'csrf': '', 'data': {}})
             if auth['status'] != 200:
                 return json_response(auth['data'], auth['status'])
             valid_ids = set(auth['data'].get('ids', []))
+            if action == 'flows-since':
+                try:
+                    after_id = max(0, int(request.query.get('after_id', ['0'])[0]))
+                    limit = max(1, min(20, int(request.query.get('limit', ['10'])[0])))
+                except ValueError:
+                    raise Reject(400, 'Invalid cursor or limit')
+                return json_response(build_flows_since(after_id, auth['data'].get('ids', []), limit=limit))
             if action == 'flows-search':
                 q = request.query.get('q', [''])[0]
                 return json_response(search_flows(q, auth['data'].get('ids', [])))

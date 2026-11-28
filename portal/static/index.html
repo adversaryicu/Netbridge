@@ -29,6 +29,10 @@
 <main id="main-content">
   <div class="site-shell" id="page-shell">
     <div id="notice" role="status" aria-live="polite" hidden></div>
+    <div id="archive-banner" class="archive-banner" role="status" aria-live="polite" hidden>
+      <span id="archive-banner-text"></span>
+      <button class="danger-button" id="archive-clear-btn" type="button">Clear Browser Archive</button>
+    </div>
 
     <section id="setup" hidden>
       <header class="section-page-header">
@@ -252,6 +256,7 @@
         </div>
         <div class="inspection-controls">
           <button class="primary" id="inspector-toggle-inspection" type="button">Enable inspection</button>
+          <button class="quiet" id="toggle-browser-archive" type="button" title="Store full session flows in this tab using a RAM-only AES-256-GCM key in IndexedDB">Browser Archive: Off</button>
           <button class="quiet" id="pause-flows" type="button">Pause</button>
           <a class="button quiet" id="export-jsonl" href="/api/flows-export?format=jsonl">JSONL</a>
           <a class="button quiet" id="export-har" href="/api/flows-export?format=har">HAR</a>
