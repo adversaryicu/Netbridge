@@ -108,6 +108,8 @@ class ManageTests(unittest.TestCase):
             for d in (dest, etc_dir, sysd, apps, imgs):
                 d.mkdir(parents=True)
             (dest / 'netbridge-network.py').write_text('# old')
+            (dest / 'portal').mkdir(parents=True)
+            (dest / 'portal/obsolete.py').write_text('# should be removed')
             (etc_dir / 'phase1.toml').write_text('custom = true\n')
 
             calls = []
@@ -122,7 +124,8 @@ class ManageTests(unittest.TestCase):
                  patch.object(manage, 'SYSTEMD_DIR', sysd), \
                  patch.object(manage, 'APPLAUNCH_APPS', apps), \
                  patch.object(manage, 'APPLAUNCH_IMAGES', imgs), \
-                 patch.object(manage, '_compile_watchdog'), \
+                 patch.object(manage, '_compile_watchdog', side_effect=lambda source, target=None: (target or (dest / 'netbridge-lease')).write_bytes(b'bin')), \
+                 patch.object(manage, '_reconcile_mitm_venv'), \
                  patch.object(manage, '_is_active', side_effect=lambda s: s == 'netbridge-portal'), \
                  patch.object(manage, 'run', side_effect=fake_run), \
                  patch.object(os, 'chown', lambda *a: None, create=True):
@@ -130,10 +133,52 @@ class ManageTests(unittest.TestCase):
 
             self.assertEqual('custom = true\n', (etc_dir / 'phase1.toml').read_text())
             self.assertTrue((dest / 'portal/proxy_addon.py').exists())
+            self.assertFalse((dest / 'portal/obsolete.py').exists())
             self.assertTrue((sysd / 'netbridge-proxy.service').exists())
             self.assertIn(('systemctl', 'daemon-reload'), calls)
             self.assertIn(('systemctl', 'restart', 'netbridge-portal'), calls)
             self.assertNotIn(('systemctl', 'restart', 'netbridge-controller'), calls)
+
+    def test_update_rolls_back_when_service_fails_to_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            dest = base / 'usr_local_lib'
+            etc_dir = base / 'etc_netbridge'
+            sysd = base / 'systemd'
+            apps = base / 'apps'
+            imgs = base / 'imgs'
+            for d in (dest / 'portal', etc_dir, sysd, apps, imgs):
+                d.mkdir(parents=True)
+            (dest / 'netbridge-network.py').write_text('# previous-script')
+            (dest / 'portal/server.py').write_text('# previous-portal')
+            (etc_dir / 'phase1.toml').write_text('custom = true\n')
+
+            is_active_calls = {'n': 0}
+            def fake_is_active(svc):
+                if svc != 'netbridge-portal':
+                    return False
+                is_active_calls['n'] += 1
+                # True before update, False after restart -> triggers rollback
+                return is_active_calls['n'] == 1
+
+            with patch.object(manage, 'require_root'), \
+                 patch.object(manage, 'check_prerequisites'), \
+                 patch.object(manage, 'DEST', dest), \
+                 patch.object(manage, 'ETC_DIR', etc_dir), \
+                 patch.object(manage, 'SYSTEMD_DIR', sysd), \
+                 patch.object(manage, 'APPLAUNCH_APPS', apps), \
+                 patch.object(manage, 'APPLAUNCH_IMAGES', imgs), \
+                 patch.object(manage, '_compile_watchdog', side_effect=lambda source, target=None: (target or (dest / 'netbridge-lease')).write_bytes(b'bin')), \
+                 patch.object(manage, '_reconcile_mitm_venv'), \
+                 patch.object(manage, '_is_active', side_effect=fake_is_active), \
+                 patch.object(manage, 'run', return_value=SimpleNamespace(returncode=0, stdout='')), \
+                 patch.object(os, 'chown', lambda *a: None, create=True):
+                with self.assertRaises(SystemExit):
+                    manage.do_update(SimpleNamespace(user='digan', apt=False, no_pull=True, skip_tests=True))
+
+            self.assertEqual('# previous-script', (dest / 'netbridge-network.py').read_text())
+            self.assertEqual('# previous-portal', (dest / 'portal/server.py').read_text())
+            self.assertEqual('custom = true\n', (etc_dir / 'phase1.toml').read_text())
 
 
 if __name__ == '__main__':

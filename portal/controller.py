@@ -36,6 +36,7 @@ CAPTURE_FILTERS_FILE = Path('/run/netbridge/capture-filters.json')
 CAPTURE_CATEGORIES = ('html', 'json', 'assets', 'images', 'binary', 'websocket', 'tcp', 'errors')
 MAX_FLOWS = 80
 MAX_FLOW_STORAGE_BYTES = 6 * 1024 * 1024
+PROXY_FAIL_THRESHOLD = 3
 SYS_NET = Path('/sys/class/net')
 
 
@@ -48,9 +49,17 @@ class Controller:
     proxy_uid = None
     inspection_enabled = False
     proxy_healthy = False
+    proxy_process_healthy = False
+    proxy_functional_healthy = False
+    proxy_health_detail = 'off'
+    _proxy_fail_streak = 0
     _synced_inspected = ()
     flow_seq = 0
     flow_bytes = 0
+    retained_total = 0
+    evicted_ring = 0
+    evicted_quota = 0
+    controller_errors = 0
     capture_filters = list(CAPTURE_CATEGORIES)
     capture_host_filter = ''
     capture_skip_noise = False
@@ -71,12 +80,22 @@ class Controller:
         self.flows = deque()
         self.flow_seq = 0
         self.flow_bytes = 0
+        self.retained_total = 0
+        self.evicted_ring = 0
+        self.evicted_quota = 0
+        self.controller_errors = 0
+        self._proxy_stats = {}
+        self._stats_baseline = {}
         self.capture_filters = list(CAPTURE_CATEGORIES)
         self.capture_host_filter = ''
         self.capture_skip_noise = False
         self.flow_sizes = {}
         self.inspection_enabled = False
         self.proxy_healthy = False
+        self.proxy_process_healthy = False
+        self.proxy_functional_healthy = False
+        self.proxy_health_detail = 'off'
+        self._proxy_fail_streak = 0
         self._synced_inspected = ()
         self.operation = asyncio.Lock()
         self.firewall_lock = asyncio.Lock()
@@ -212,7 +231,7 @@ class Controller:
                     return True
         return False
 
-    async def check_proxy_health(self):
+    async def check_proxy_process_health(self):
         if not self.is_proxy_port_listening(8080):
             return False
         process = await asyncio.create_subprocess_exec(
@@ -225,6 +244,48 @@ class Controller:
             await process.wait()
             return False
         return process.returncode == 0 and out.decode().strip() == 'active'
+
+    async def check_proxy_functional_health(self, host='127.0.0.1', port=8080, timeout=2.0):
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+            writer.write(
+                f'GET /__netbridge_healthz HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n'.encode('ascii')
+            )
+            await asyncio.wait_for(writer.drain(), timeout=timeout)
+            chunks = []
+            total_len = 0
+            while total_len < 4096:
+                chunk = await asyncio.wait_for(reader.read(1024), timeout=timeout)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total_len += len(chunk)
+            resp = b''.join(chunks)
+            head, _, body = resp.partition(b'\r\n\r\n')
+            first_line = head.split(b'\r\n', 1)[0]
+            return b' 200 ' in first_line and b'netbridge-proxy-ok' in body
+        except (OSError, asyncio.TimeoutError):
+            return False
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1)
+                except (OSError, asyncio.TimeoutError):
+                    pass
+
+    async def check_proxy_health(self):
+        proc_ok = await self.check_proxy_process_health()
+        self.proxy_process_healthy = proc_ok
+        if not proc_ok:
+            self.proxy_functional_healthy = False
+            self.proxy_health_detail = 'process_down'
+            return False
+        func_ok = await self.check_proxy_functional_health()
+        self.proxy_functional_healthy = func_ok
+        self.proxy_health_detail = 'ok' if func_ok else 'functional_probe_failed'
+        return func_ok
 
     async def apply_inspected_ips(self, ips):
         script = 'flush set inet netbridge inspected_v4\n'
@@ -285,7 +346,68 @@ class Controller:
         for suffix in ('.json', '.req', '.resp'):
             (FLOWS_DIR / f'{flow_id}{suffix}').unlink(missing_ok=True)
 
+    def _read_proxy_stats(self):
+        stats_file = STAGE_DIR / 'proxy-stats.json'
+        if stats_file.is_file():
+            try:
+                data = json.loads(stats_file.read_text())
+                if isinstance(data, dict):
+                    self._proxy_stats = data
+                    return data
+            except (OSError, ValueError):
+                pass
+        return getattr(self, '_proxy_stats', {}) or {}
+
+    def get_capture_stats(self):
+        proxy = self._read_proxy_stats()
+        base = getattr(self, '_stats_baseline', {}) or {}
+        def diff(src, key, bkey=None):
+            val = int(src.get(key, 0) or 0)
+            b = int(base.get(bkey or key, 0) or 0)
+            return max(0, val - b) if val >= b else max(0, val)
+
+        observed = diff(proxy, 'observed')
+        filtered = diff(proxy, 'filtered')
+        dropped_queue = diff(proxy, 'queue_drops')
+        dropped_stage = diff(proxy, 'stage_drops')
+        ipc_failures = diff(proxy, 'ipc_failures')
+        worker_errors = diff(proxy, 'worker_errors')
+        retained = max(0, getattr(self, 'retained_total', 0) - int(base.get('retained_total', 0) or 0))
+        evicted_ring = max(0, getattr(self, 'evicted_ring', 0) - int(base.get('evicted_ring', 0) or 0))
+        evicted_quota = max(0, getattr(self, 'evicted_quota', 0) - int(base.get('evicted_quota', 0) or 0))
+        controller_errors = max(0, getattr(self, 'controller_errors', 0) - int(base.get('controller_errors', 0) or 0))
+        total_loss = dropped_queue + dropped_stage + ipc_failures + worker_errors + controller_errors
+        return {
+            'observed': observed,
+            'retained': retained,
+            'active_ring': len(self.flows) if hasattr(self, 'flows') else 0,
+            'filtered': filtered,
+            'evicted': evicted_ring + evicted_quota,
+            'evicted_ring': evicted_ring,
+            'evicted_quota': evicted_quota,
+            'dropped_queue': dropped_queue,
+            'dropped_stage': dropped_stage,
+            'worker_errors': worker_errors,
+            'ipc_failures': ipc_failures,
+            'controller_errors': controller_errors,
+            'total_loss': total_loss,
+            'last_error': str(proxy.get('last_error', '') or '')[:80],
+        }
+
     def clear_flow_files(self):
+        proxy = self._read_proxy_stats()
+        self._stats_baseline = {
+            'observed': int(proxy.get('observed', 0) or 0),
+            'filtered': int(proxy.get('filtered', 0) or 0),
+            'queue_drops': int(proxy.get('queue_drops', 0) or 0),
+            'stage_drops': int(proxy.get('stage_drops', 0) or 0),
+            'ipc_failures': int(proxy.get('ipc_failures', 0) or 0),
+            'worker_errors': int(proxy.get('worker_errors', 0) or 0),
+            'retained_total': getattr(self, 'retained_total', 0),
+            'evicted_ring': getattr(self, 'evicted_ring', 0),
+            'evicted_quota': getattr(self, 'evicted_quota', 0),
+            'controller_errors': getattr(self, 'controller_errors', 0),
+        }
         if hasattr(self, 'flows'):
             self.flows.clear()
         if hasattr(self, 'flow_sizes'):
@@ -294,13 +416,14 @@ class Controller:
         for directory in (FLOWS_DIR, STAGE_DIR):
             if directory.exists():
                 for item in directory.iterdir():
-                    if item.is_file():
+                    if item.is_file() and item.name != 'proxy-stats.json':
                         item.unlink(missing_ok=True)
 
     def _enforce_flow_quota(self):
         while getattr(self, 'flow_bytes', 0) > MAX_FLOW_STORAGE_BYTES and len(self.flows) > 1:
             oldest = self.flows.popleft()
             self._delete_flow_files(oldest['id'])
+            self.evicted_quota = getattr(self, 'evicted_quota', 0) + 1
 
     def record_flow(self, raw, stage=None):
         staged_meta = None
@@ -345,12 +468,16 @@ class Controller:
                 server_port = 0
             payload_status = str(raw.get('payload_status', ''))
             if payload_status not in ('complete', 'partial', 'streamed', 'empty'):
-                if raw.get('req_truncated') or raw.get('resp_truncated'):
+                if raw.get('req_truncated') or raw.get('resp_truncated') or raw.get('messages_truncated'):
                     payload_status = 'partial'
                 elif req_bytes == 0 and byte_count == 0:
                     payload_status = 'empty'
                 else:
                     payload_status = 'complete'
+            try:
+                omitted_messages = max(0, int(raw.get('omitted_messages', 0) or 0))
+            except (TypeError, ValueError):
+                omitted_messages = 0
             summary = {
                 'id': flow_id,
                 'time': str(raw.get('time', ''))[:32],
@@ -371,6 +498,8 @@ class Controller:
                 'state': state,
                 'detail': str(raw.get('detail', ''))[:120],
             }
+            if omitted_messages:
+                summary['omitted_messages'] = omitted_messages
             if FLOWS_DIR.is_dir():
                 portal_gid = getattr(self, 'portal_gid', None)
                 meta_dest = FLOWS_DIR / f'{flow_id}.json'
@@ -389,8 +518,16 @@ class Controller:
             while len(self.flows) >= MAX_FLOWS:
                 oldest = self.flows.popleft()
                 self._delete_flow_files(oldest['id'])
+                self.evicted_ring = getattr(self, 'evicted_ring', 0) + 1
             self.flows.append(summary)
+            self.retained_total = getattr(self, 'retained_total', 0) + 1
             self._enforce_flow_quota()
+        except Failure:
+            self.controller_errors = getattr(self, 'controller_errors', 0) + 1
+            raise
+        except Exception:
+            self.controller_errors = getattr(self, 'controller_errors', 0) + 1
+            raise
         finally:
             if staged_meta is not None:
                 staged_meta.unlink(missing_ok=True)
@@ -432,16 +569,45 @@ class Controller:
         while True:
             try:
                 if self.inspection_enabled:
-                    healthy = await self.check_proxy_health()
+                    proc_ok = await self.check_proxy_process_health()
+                    self.proxy_process_healthy = proc_ok
+                    if not proc_ok:
+                        self.proxy_functional_healthy = False
+                        self.proxy_health_detail = 'process_down'
+                        self._proxy_fail_streak = PROXY_FAIL_THRESHOLD
+                        healthy = False
+                    else:
+                        func_ok = await self.check_proxy_functional_health()
+                        self.proxy_functional_healthy = func_ok
+                        if func_ok:
+                            self._proxy_fail_streak = 0
+                            self.proxy_health_detail = 'ok'
+                            healthy = True
+                        else:
+                            self._proxy_fail_streak = getattr(self, '_proxy_fail_streak', 0) + 1
+                            self.proxy_health_detail = 'functional_probe_failed'
+                            healthy = self.proxy_healthy if self._proxy_fail_streak < PROXY_FAIL_THRESHOLD else False
                     if healthy != self.proxy_healthy:
                         self.proxy_healthy = healthy
-                        self.audit_event('proxy_healthy' if healthy else 'proxy_unhealthy_fail_open')
+                        if healthy:
+                            self.audit_event('proxy_healthy')
+                        elif proc_ok:
+                            self.audit_event('proxy_functional_unhealthy_fail_open')
+                        else:
+                            self.audit_event('proxy_unhealthy_fail_open')
                         await self.sync_inspection_firewall(force=True)
-                elif self.proxy_healthy or self._synced_inspected:
-                    self.proxy_healthy = False
-                    await self.sync_inspection_firewall(force=True)
+                else:
+                    self.proxy_process_healthy = False
+                    self.proxy_functional_healthy = False
+                    self.proxy_health_detail = 'off'
+                    self._proxy_fail_streak = 0
+                    if self.proxy_healthy or self._synced_inspected:
+                        self.proxy_healthy = False
+                        await self.sync_inspection_firewall(force=True)
             except Exception:
                 self.proxy_healthy = False
+                self.proxy_functional_healthy = False
+                self.proxy_health_detail = 'monitor_error'
                 self.audit_event('proxy_monitor_failed')
             await asyncio.sleep(2)
 
@@ -495,10 +661,14 @@ class Controller:
         data = request.get('data') or {}
         if not isinstance(data, dict):
             raise Failure('Invalid request')
-        if action == 'flow-event':
+        if action in ('flow-event', 'capture-stats'):
             peer_uid = request.get('_peer_uid')
             if peer_uid is None or (peer_uid != 0 and peer_uid != self.proxy_uid):
                 raise Failure('Forbidden', 403)
+            if action == 'capture-stats':
+                stats = request.get('stats') if isinstance(request.get('stats'), dict) else data
+                self._proxy_stats = dict(stats)
+                return {'ok': True}
             self.record_flow(request.get('event') if 'event' in request else data, stage=request.get('stage'))
             return {'ok': True}
         ip = str(ipaddress.ip_address(request.get('ip', '0.0.0.0')))
@@ -554,7 +724,11 @@ class Controller:
             return self.new_session()
         record = self.authorize(request, mutate=action not in ('status', 'flow-index'))
         if action == 'flow-index':
-            return {'ok': True, 'ids': [f['id'] for f in self.flows] if hasattr(self, 'flows') else []}
+            return {
+                'ok': True,
+                'ids': [f['id'] for f in self.flows] if hasattr(self, 'flows') else [],
+                'capture_stats': self.get_capture_stats(),
+            }
         if action == 'status':
             clients = [{k: v for k, v in c.items() if k in ('mac', 'ip', 'name', 'downloaded', 'trust_confirmed', 'approved')}
                        for c in self.clients.values()]
@@ -562,7 +736,14 @@ class Controller:
             flows = list(reversed(self.flows)) if hasattr(self, 'flows') else []
             return {'csrf': record['csrf'], 'clients': clients, 'monitor': self.health,
                     'wan_connected': wan.read_text().strip() == '1', 'inspection': self.inspection_state(),
+                    'proxy_health': {
+                        'process': getattr(self, 'proxy_process_healthy', False),
+                        'functional': getattr(self, 'proxy_functional_healthy', False),
+                        'detail': getattr(self, 'proxy_health_detail', 'off'),
+                        'fail_streak': getattr(self, '_proxy_fail_streak', 0),
+                    },
                     'inspected_clients': len(self.desired_inspected_ips()), 'flows': flows,
+                    'capture_stats': self.get_capture_stats(),
                     'capture_filters': list(getattr(self, 'capture_filters', CAPTURE_CATEGORIES)),
                     'capture_host_filter': str(getattr(self, 'capture_host_filter', '') or ''),
                     'capture_skip_noise': bool(getattr(self, 'capture_skip_noise', False)),
@@ -720,7 +901,7 @@ class Controller:
             request = json.loads(raw)
             if not isinstance(request, dict):
                 raise Failure('Invalid request')
-            if uid == self.proxy_uid and request.get('action') != 'flow-event':
+            if uid == self.proxy_uid and request.get('action') not in ('flow-event', 'capture-stats'):
                 raise Failure('Forbidden', 403)
             request['_peer_uid'] = uid
             result = await self.dispatch(request)

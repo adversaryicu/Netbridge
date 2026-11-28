@@ -116,11 +116,49 @@ def _write_bytes(path, data, mode):
     tmp.replace(path)
 
 
-def _compile_watchdog(source=SOURCE):
+def _compile_watchdog(source=SOURCE, target=None):
     src = source / 'scripts/netbridge-lease.c'
     out = source / 'scripts/netbridge-lease'
     run('cc', '-O2', '-Wall', '-Wextra', '-Werror', '-o', str(out), str(src), timeout=120)
-    _write_bytes(DEST / 'netbridge-lease', out.read_bytes(), 0o755)
+    _write_bytes(target or (DEST / 'netbridge-lease'), out.read_bytes(), 0o755)
+
+
+def _validate_python_tree(paths):
+    for path in paths:
+        compile(path.read_text(encoding='utf-8'), str(path), 'exec')
+
+
+def _reconcile_mitm_venv(source=SOURCE):
+    venv_pip = DEST / 'mitm-venv/bin/pip'
+    venv_py = DEST / 'mitm-venv/bin/python3'
+    portal_script = source / 'scripts/netbridge-portal.py'
+    if not venv_py.is_file() or not venv_pip.is_file() or not portal_script.is_file():
+        return
+    match = re.search(r"MITMPROXY_VERSION\s*=\s*['\"]([^'\"]+)['\"]", portal_script.read_text())
+    if not match:
+        return
+    desired = match.group(1)
+    res = run(
+        str(venv_py), '-c',
+        'import importlib.metadata; print(importlib.metadata.version("mitmproxy"))',
+        check=False, capture=True, timeout=15,
+    )
+    current = (res.stdout or '').strip() if res.returncode == 0 else ''
+    if current != desired:
+        run(str(venv_pip), 'install', '--only-binary=:all:', f'mitmproxy=={desired}', timeout=600)
+
+
+def _copy_if_exists(src, dst):
+    if src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def _restore_file(src, dst, mode):
+    if src.is_file():
+        _write_bytes(dst, src.read_bytes(), mode)
+    else:
+        dst.unlink(missing_ok=True)
 
 
 def _is_active(unit):
@@ -156,26 +194,83 @@ def do_update(args):
         run_tests(SOURCE)
 
     was_active = [svc for svc in ACTIVE_MANAGED_SERVICES if _is_active(svc)]
-    _compile_watchdog(SOURCE)
+    stage_dir = DEST.parent / f'.{DEST.name}.stage'
+    backup_dir = DEST.parent / f'.{DEST.name}.backup'
+    shutil.rmtree(stage_dir, ignore_errors=True)
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    activated = False
 
-    portal_dest = DEST / 'portal'
-    portal_dest.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(SOURCE / 'portal', portal_dest, dirs_exist_ok=True, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-    for path in portal_dest.rglob('*'):
-        os.chown(path, 0, 0)
-        path.chmod(0o755 if path.is_dir() else 0o644)
+    try:
+        _compile_watchdog(SOURCE, target=stage_dir / 'netbridge-lease')
+        staged_portal = stage_dir / 'portal'
+        shutil.copytree(SOURCE / 'portal', staged_portal, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        for path in staged_portal.rglob('*'):
+            os.chown(path, 0, 0)
+            path.chmod(0o755 if path.is_dir() else 0o644)
+        _validate_python_tree(list(staged_portal.rglob('*.py')) + [SOURCE / 'scripts' / name for name in SCRIPT_BINARIES])
+        if not (staged_portal / 'server.py').is_file() or not (stage_dir / 'netbridge-lease').is_file():
+            raise RuntimeError('Staged update is missing required application files')
 
-    for name in SCRIPT_BINARIES:
-        _write_bytes(DEST / name, (SOURCE / 'scripts' / name).read_bytes(), 0o755)
-    for unit in SYSTEMD_UNITS:
-        _write_bytes(SYSTEMD_DIR / unit, (SOURCE / 'systemd' / unit).read_bytes(), 0o644)
-    _write_bytes(APPLAUNCH_IMAGES / 'netbridge-icon.png', (SOURCE / 'assets/netbridge-icon.png').read_bytes(), 0o644)
-    _write_bytes(DEST / 'adversaryicu-logo.png', (SOURCE / 'assets/adversaryicu-logo.png').read_bytes(), 0o644)
-    _write_bytes(APPLAUNCH_APPS / 'netbridge.desktop', (SOURCE / 'netbridge.desktop').read_bytes(), 0o644)
+        # Back up existing installed files before mutating DEST or systemd.
+        portal_dest = DEST / 'portal'
+        if portal_dest.exists():
+            shutil.copytree(portal_dest, backup_dir / 'portal', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        _copy_if_exists(DEST / 'netbridge-lease', backup_dir / 'netbridge-lease')
+        for name in SCRIPT_BINARIES:
+            _copy_if_exists(DEST / name, backup_dir / 'scripts' / name)
+        for unit in SYSTEMD_UNITS:
+            _copy_if_exists(SYSTEMD_DIR / unit, backup_dir / 'systemd' / unit)
+        _copy_if_exists(APPLAUNCH_IMAGES / 'netbridge-icon.png', backup_dir / 'netbridge-icon.png')
+        _copy_if_exists(DEST / 'adversaryicu-logo.png', backup_dir / 'adversaryicu-logo.png')
+        _copy_if_exists(APPLAUNCH_APPS / 'netbridge.desktop', backup_dir / 'netbridge.desktop')
 
-    run('systemctl', 'daemon-reload', timeout=30)
-    for svc in was_active:
-        run('systemctl', 'restart', svc, timeout=60)
+        _reconcile_mitm_venv(SOURCE)
+
+        # Activate staged update atomically/cleanly (removing obsolete portal files).
+        activated = True
+        if portal_dest.exists():
+            shutil.rmtree(portal_dest)
+        shutil.move(str(staged_portal), str(portal_dest))
+        _write_bytes(DEST / 'netbridge-lease', (stage_dir / 'netbridge-lease').read_bytes(), 0o755)
+        for name in SCRIPT_BINARIES:
+            _write_bytes(DEST / name, (SOURCE / 'scripts' / name).read_bytes(), 0o755)
+        for unit in SYSTEMD_UNITS:
+            _write_bytes(SYSTEMD_DIR / unit, (SOURCE / 'systemd' / unit).read_bytes(), 0o644)
+        _write_bytes(APPLAUNCH_IMAGES / 'netbridge-icon.png', (SOURCE / 'assets/netbridge-icon.png').read_bytes(), 0o644)
+        _write_bytes(DEST / 'adversaryicu-logo.png', (SOURCE / 'assets/adversaryicu-logo.png').read_bytes(), 0o644)
+        _write_bytes(APPLAUNCH_APPS / 'netbridge.desktop', (SOURCE / 'netbridge.desktop').read_bytes(), 0o644)
+
+        run('systemctl', 'daemon-reload', timeout=30)
+        for svc in was_active:
+            run('systemctl', 'restart', svc, timeout=60)
+            if not _is_active(svc):
+                raise RuntimeError(f'Service failed to become active after update: {svc}')
+    except Exception as exc:
+        if activated:
+            portal_dest = DEST / 'portal'
+            if (backup_dir / 'portal').is_dir():
+                shutil.rmtree(portal_dest, ignore_errors=True)
+                shutil.copytree(backup_dir / 'portal', portal_dest)
+                for path in portal_dest.rglob('*'):
+                    os.chown(path, 0, 0)
+                    path.chmod(0o755 if path.is_dir() else 0o644)
+            _restore_file(backup_dir / 'netbridge-lease', DEST / 'netbridge-lease', 0o755)
+            for name in SCRIPT_BINARIES:
+                _restore_file(backup_dir / 'scripts' / name, DEST / name, 0o755)
+            for unit in SYSTEMD_UNITS:
+                _restore_file(backup_dir / 'systemd' / unit, SYSTEMD_DIR / unit, 0o644)
+            _restore_file(backup_dir / 'netbridge-icon.png', APPLAUNCH_IMAGES / 'netbridge-icon.png', 0o644)
+            _restore_file(backup_dir / 'adversaryicu-logo.png', DEST / 'adversaryicu-logo.png', 0o644)
+            _restore_file(backup_dir / 'netbridge.desktop', APPLAUNCH_APPS / 'netbridge.desktop', 0o644)
+            run('systemctl', 'daemon-reload', check=False, timeout=30)
+            for svc in was_active:
+                run('systemctl', 'restart', svc, check=False, timeout=60)
+        raise SystemExit(f'NetBridge update failed{" and rolled back to previous version" if activated else ""}: {exc}') from exc
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        shutil.rmtree(backup_dir, ignore_errors=True)
 
     print('NetBridge updated cleanly; existing config, CA identity, and admin credentials preserved.')
     if was_active:

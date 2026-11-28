@@ -101,22 +101,26 @@ function busy(form, action) {
     try { await action(); } catch (error) { notice(error.message, true); } finally { button.disabled = false; }
   });
 }
-function setInspectionState(state) {
+function setInspectionState(state, proxyHealth) {
   inspectionState = state || 'off';
   const meta = $('meta-inspection');
   const metric = $('inspection-state');
   const heading = $('control-heading');
   const hb = $('hb-state');
+  const detail = proxyHealth && proxyHealth.detail && proxyHealth.detail !== 'ok' && proxyHealth.detail !== 'off'
+    ? ` (${proxyHealth.detail.replace(/_/g, ' ')})`
+    : '';
   const label = inspectionState === 'on' ? 'active' : inspectionState === 'degraded' ? 'fail-open' : 'off';
   if (meta) {
     meta.textContent = label;
     meta.className = inspectionState === 'on' ? 'state-on' : inspectionState === 'degraded' ? 'state-warn' : 'state-off';
   }
   if (metric) metric.textContent = inspectionState === 'on' ? 'Active' : inspectionState === 'degraded' ? 'Fail-open' : 'Off';
-  if (heading) heading.textContent = inspectionState === 'on' ? 'Inspection is active' : inspectionState === 'degraded' ? 'Fail-open active (proxy unavailable)' : 'Inspection is currently off';
+  if (heading) heading.textContent = inspectionState === 'on' ? 'Inspection is active' : inspectionState === 'degraded' ? `Fail-open active${detail || ' (proxy unavailable)'}` : 'Inspection is currently off';
   if (hb) {
     hb.textContent = flowsPaused ? `${label.toUpperCase()} (PAUSED)` : label.toUpperCase();
     hb.className = inspectionState === 'on' ? 'state-on' : inspectionState === 'degraded' ? 'state-warn' : '';
+    hb.title = detail ? `Proxy health: ${proxyHealth.detail}` : '';
   }
   for (const btnId of ['admin-toggle-inspection', 'inspector-toggle-inspection']) {
     const btn = $(btnId);
@@ -359,7 +363,14 @@ function renderMessageTab(part) {
   }
   if (view.truncated || view.hex_truncated || view.text_truncated) {
     const note = document.createElement('p'); note.className = 'small trunc-note';
-    note.textContent = `Showing ${formatBytes(Math.min(view.captured, 32768))} preview of ${formatBytes(view.size)} total (${formatBytes(view.captured)} captured). Use Download Raw or Export Hex for full payload.`;
+    if (view.decoded_size_known === false) {
+      const minText = view.decoded_bytes_min ? `>= ${formatBytes(view.decoded_bytes_min)} decoded` : 'Unknown decoded size';
+      const wireText = view.wire_bytes ? `, ${formatBytes(view.wire_bytes)} compressed/wire` : '';
+      const encText = view.content_encoding ? ` (${view.content_encoding})` : '';
+      note.textContent = `Showing ${formatBytes(Math.min(view.captured, 32768))} preview (${formatBytes(view.captured)} retained · ${minText}${wireText}${encText}).`;
+    } else {
+      note.textContent = `Showing ${formatBytes(Math.min(view.captured, 32768))} preview of ${formatBytes(view.size)} total (${formatBytes(view.captured)} captured). Use Download Raw or Export Hex for full payload.`;
+    }
     wrap.append(note);
   }
 
@@ -435,19 +446,33 @@ function renderDetailsTab() {
     ]);
   }
 
-  addSection('Timing & Sizes', [
+  const reqSizeText = f.req_decoded_size_known === false
+    ? `Unknown decoded size (${f.req_decoded_bytes_min ? `>= ${formatBytes(f.req_decoded_bytes_min)}, ` : ''}${formatBytes(f.req_wire_bytes || 0)} wire, ${formatBytes(f.req_retained_bytes || 0)} retained)`
+    : `${formatBytes(f.req_bytes || 0)}${f.req_retained_bytes !== undefined && f.req_retained_bytes < (f.req_bytes || 0) ? ` (${formatBytes(f.req_retained_bytes)} retained)` : ''}`;
+  const respSizeText = f.resp_decoded_size_known === false
+    ? `Unknown decoded size (${f.resp_decoded_bytes_min ? `>= ${formatBytes(f.resp_decoded_bytes_min)}, ` : ''}${formatBytes(f.resp_wire_bytes || 0)} wire, ${formatBytes(f.resp_retained_bytes || 0)} retained)`
+    : `${formatBytes(f.bytes || 0)}${f.resp_retained_bytes !== undefined && f.resp_retained_bytes < (f.bytes || 0) ? ` (${formatBytes(f.resp_retained_bytes)} retained)` : ''}`;
+  const timingRows = [
     ['Started (UTC)', t.start || f.time || '—'],
     ['TLS Handshake', t.tls_setup || '—'],
     ['Completed', t.end || '—'],
     ['Duration', `${f.duration_ms || 0} ms`],
-    ['Request Size', formatBytes(f.req_bytes || 0)],
-    ['Response Size', formatBytes(f.bytes || 0)],
+    ['Request Size', reqSizeText],
+    ['Response Size', respSizeText],
     ['Payload Status', f.payload_status || '—'],
-    ...(f.detail ? [['Note', f.detail]] : []),
-  ]);
+  ];
+  if (f.total_messages !== undefined) {
+    const msgText = f.omitted_messages > 0
+      ? `${f.retained_messages} / ${f.total_messages} (${f.omitted_messages} omitted)`
+      : `${f.total_messages}`;
+    timingRows.push(['Messages', msgText]);
+  }
+  if (f.detail) timingRows.push(['Note', f.detail]);
+  addSection('Timing & Sizes', timingRows);
 
   if (Array.isArray(f.frames) && f.frames.length) {
-    const h = document.createElement('h4'); h.className = 'detail-heading'; h.textContent = `Stream Frames / Chunks (${f.frames.length})`;
+    const totalLabel = f.total_messages && f.total_messages > f.frames.length ? `${f.frames.length} of ${f.total_messages}` : `${f.frames.length}`;
+    const h = document.createElement('h4'); h.className = 'detail-heading'; h.textContent = `Stream Frames / Chunks (${totalLabel})`;
     const rows = f.frames.map((fr, idx) => [`#${idx + 1} ${fr.dir}`, `${formatBytes(fr.len)} ${fr.type || ''} @ ${fr.time || ''}`.trim()]);
     wrap.append(h, makeKVTable(rows));
   }
@@ -491,7 +516,7 @@ async function refreshProtected() {
   pollBusy = true;
   try {
     const state = await api('status');
-    setInspectionState(state.inspection);
+    setInspectionState(state.inspection, state.proxy_health);
     const wanText = state.wan_connected ? 'connected' : 'offline';
     $('meta-wan').textContent = wanText;
     lastClients = state.clients || [];
@@ -510,6 +535,13 @@ async function refreshProtected() {
         }
       }
       $('hb-flows').textContent = `${lastFlows.length} / 80`;
+      if ($('hb-loss') && state.capture_stats) {
+        const cs = state.capture_stats;
+        const lost = cs.total_loss || 0;
+        $('hb-loss').textContent = lost > 0 ? `${lost} lost` : '0 lost';
+        $('hb-loss').className = lost > 0 ? 'state-warn' : '';
+        $('hb-loss').title = `Observed: ${cs.observed || 0}, Retained: ${cs.retained || 0}, Filtered: ${cs.filtered || 0}, Evicted: ${cs.evicted || 0} (ring ${cs.evicted_ring || 0}, quota ${cs.evicted_quota || 0}), Queue drops: ${cs.dropped_queue || 0}, Stage drops: ${cs.dropped_stage || 0}, Worker errors: ${cs.worker_errors || 0}, IPC failures: ${cs.ipc_failures || 0}, Controller errors: ${cs.controller_errors || 0}${cs.last_error ? ' | Last: ' + cs.last_error : ''}`;
+      }
       $('hb-last-poll').textContent = formatClock(new Date().toISOString(), false);
       $('hb-last-event').textContent = lastFlows.length ? formatClock(lastFlows[0].time, true) : 'None yet';
       if (!flowsPaused) {
@@ -721,8 +753,10 @@ busy($('rotate-form'), async () => {
 });
 
 function triggerExportDownload(url) {
+  const sep = url.includes('?') ? '&' : '?';
+  const confirmedUrl = url.includes('confirm=') ? url : `${url}${sep}confirm=unredacted`;
   const link = document.createElement('a');
-  link.href = url;
+  link.href = confirmedUrl;
   link.download = '';
   document.body.append(link);
   link.click();
@@ -730,8 +764,11 @@ function triggerExportDownload(url) {
 }
 function requestExportConfirmation(url, label) {
   const dialog = $('export-confirm-dialog');
+  const extra = label === 'CSV (Raw)'
+    ? ' Raw CSV preserves untrusted cell values verbatim without spreadsheet formula escaping.'
+    : '';
   if (!dialog || typeof dialog.showModal !== 'function') {
-    if (confirm(`Plain-text export warning: ${label} exports are unredacted and can expose sensitive information such as tokens, cookies, or credentials. Continue?`)) {
+    if (confirm(`Plain-text export warning: ${label} exports are unredacted and can expose sensitive information such as tokens, cookies, or credentials.${extra} Continue?`)) {
       triggerExportDownload(url);
     }
     return;
@@ -739,12 +776,15 @@ function requestExportConfirmation(url, label) {
   pendingExportUrl = url;
   $('export-confirm-title').textContent = `Export unredacted ${label}?`;
   $('export-confirm-proceed').textContent = `Export ${label}`;
+  if ($('export-confirm-copy')) {
+    $('export-confirm-copy').textContent = `NetBridge logs are unredacted plain text. Exporting can expose sensitive information such as authentication tokens, session cookies, API keys, passwords, or private payloads.${extra} Confirm that you want to download this file.`;
+  }
   dialog.showModal();
 }
 
 $('admin-toggle-inspection').addEventListener('click', () => toggleInspection($('admin-toggle-inspection')));
 $('inspector-toggle-inspection').addEventListener('click', () => toggleInspection($('inspector-toggle-inspection')));
-for (const [id, label] of [['export-jsonl', 'JSONL'], ['export-har', 'HAR'], ['export-csv', 'CSV']]) {
+for (const [id, label] of [['export-jsonl', 'JSONL'], ['export-har', 'HAR'], ['export-csv-safe', 'CSV (Safe)'], ['export-csv', 'CSV (Raw)']]) {
   const el = $(id);
   if (el) {
     el.addEventListener('click', event => {

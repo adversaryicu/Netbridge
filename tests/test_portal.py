@@ -412,24 +412,120 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 detail = json.loads(resp.body)
                 self.assertIn('de ad be ef', detail['request']['hex'])
                 self.assertTrue(detail['response']['is_inline_image'])
-                # Inline PNG image
+                # Inline PNG image (allowed without confirmation)
                 ev_img = h11.Request(method=b'GET', target=b'/api/flow-raw?id=1&part=response&format=raw',
                                      headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
                 resp_img = await self.portal.route(server.Request(ev_img, b'', '192.168.50.100', True))
                 self.assertEqual(b'\x89PNG\r\n\x1a\n', resp_img.body)
                 self.assertEqual('image/png', resp_img.headers['Content-Type'])
-                # Hex export
-                ev_hex = h11.Request(method=b'GET', target=b'/api/flow-raw?id=1&part=request&format=hex&download=1',
+                # Non-image raw payload without download=1 still requires confirmation
+                ev_raw_no_confirm = h11.Request(method=b'GET', target=b'/api/flow-raw?id=1&part=request&format=raw',
+                                                headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
+                with self.assertRaises(server.Reject) as ctx_raw:
+                    await self.portal.route(server.Request(ev_raw_no_confirm, b'', '192.168.50.100', True))
+                self.assertEqual(400, ctx_raw.exception.status)
+                # Hex export (requires explicit confirmation)
+                ev_hex = h11.Request(method=b'GET', target=b'/api/flow-raw?id=1&part=request&format=hex&download=1&confirm=unredacted',
                                      headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
                 resp_hex = await self.portal.route(server.Request(ev_hex, b'', '192.168.50.100', True))
                 self.assertIn(b'00000000  de ad be ef', resp_hex.body)
-                # Bulk exports: JSONL, HAR, CSV
+                # Bulk exports: JSONL, HAR, CSV (require confirm=unredacted and stream chunks)
                 for fmt, expect in (('jsonl', b'c2.example'), ('har', b'"version": "1.2"'), ('csv', b'c2.example')):
-                    ev_exp = h11.Request(method=b'GET', target=f'/api/flows-export?format={fmt}'.encode(),
+                    ev_exp = h11.Request(method=b'GET', target=f'/api/flows-export?format={fmt}&confirm=unredacted'.encode(),
                                          headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
                     resp_exp = await self.portal.route(server.Request(ev_exp, b'', '192.168.50.100', True))
                     self.assertEqual(200, resp_exp.status)
-                    self.assertIn(expect, resp_exp.body)
+                    body = b''.join(resp_exp.chunks) if isinstance(resp_exp, server.StreamingResponse) else resp_exp.body
+                    self.assertIn(expect, body)
+
+    async def test_nb006_export_confirmation_and_nb007_safe_csv_and_nb005_har(self):
+        import h11, base64
+        with tempfile.TemporaryDirectory() as td:
+            flows_dir = Path(td)
+            (flows_dir / '1.json').write_text(json.dumps({
+                'id': 1, 'time': '2026-11-28T10:00:00Z', 'client_ip': '192.168.50.100',
+                'server_ip': '93.184.216.34', 'server_port': 8443, 'method': 'GET',
+                'scheme': 'https', 'host': 'app.example', 'path': '/=1+1?a=1',
+                'http_version': 'HTTP/1.1', 'resp_http_version': 'HTTP/1.1',
+                'status': 302, 'reason': 'Found', 'content_type': 'text/html',
+                'req_content_type': '', 'req_bytes': 0, 'bytes': 2,
+                'duration_ms': 12, 'state': 'decrypted', 'detail': '=cmd()',
+                'payload_status': 'complete',
+                'request_headers': [['Host', 'app.example:8443'], ['Cookie', 'sid=abc; theme=dark']],
+                'response_headers': [['Location', 'https://app.example:8443/next'], ['Set-Cookie', 'tok=xyz; HttpOnly']],
+                'resp_b64': base64.b64encode(b'hi').decode('ascii'),
+            }))
+            (flows_dir / '2.json').write_text(json.dumps({
+                'id': 2, 'time': '2026-11-28T10:00:01Z', 'client_ip': '192.168.50.100',
+                'server_ip': '198.51.100.5', 'server_port': 4444, 'method': 'TCP',
+                'scheme': 'tcp', 'host': '198.51.100.5', 'path': ':4444',
+                'status': 0, 'state': 'tcp', 'detail': '1 TCP chunks',
+            }))
+            with patch.object(server, 'FLOWS_DIR', flows_dir), \
+                 patch.object(server, 'rpc', new=AsyncMock(return_value={'status': 200, 'data': {'ok': True, 'ids': [1, 2], 'capture_stats': {'observed': 2, 'total_loss': 0}}})):
+                # NB-006: Unconfirmed export rejected
+                ev_no = h11.Request(method=b'GET', target=b'/api/flows-export?format=csv',
+                                    headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
+                with self.assertRaises(server.Reject) as ctx:
+                    await self.portal.route(server.Request(ev_no, b'', '192.168.50.100', True))
+                self.assertEqual(400, ctx.exception.status)
+
+                # NB-007: Safe CSV neutralizes formula cells; raw CSV preserves them
+                ev_safe = h11.Request(method=b'GET', target=b'/api/flows-export?format=csv&safe=1&confirm=unredacted',
+                                      headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
+                resp_safe = await self.portal.route(server.Request(ev_safe, b'', '192.168.50.100', True))
+                self.assertEqual('safe', resp_safe.headers['X-NetBridge-CSV-Mode'])
+                safe_text = b''.join(resp_safe.chunks).decode('utf-8')
+                self.assertIn("'=cmd()", safe_text)
+
+                ev_raw = h11.Request(method=b'GET', target=b'/api/flows-export?format=csv&confirm=unredacted',
+                                     headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
+                resp_raw = await self.portal.route(server.Request(ev_raw, b'', '192.168.50.100', True))
+                self.assertEqual('raw', resp_raw.headers['X-NetBridge-CSV-Mode'])
+                raw_text = b''.join(resp_raw.chunks).decode('utf-8')
+                self.assertIn(',=cmd(),', raw_text)
+
+                # NB-005: HAR fidelity
+                ev_har = h11.Request(method=b'GET', target=b'/api/flows-export?format=har&confirm=unredacted',
+                                     headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
+                resp_har = await self.portal.route(server.Request(ev_har, b'', '192.168.50.100', True))
+                har = json.loads(b''.join(resp_har.chunks).decode('utf-8'))
+                self.assertEqual(1, len(har['log']['entries']))
+                self.assertEqual(1, har['log']['_netbridge']['skipped_non_http'])
+                entry = har['log']['entries'][0]
+                self.assertEqual('https://app.example:8443/=1+1?a=1', entry['request']['url'])
+                self.assertEqual('https://app.example:8443/next', entry['response']['redirectURL'])
+                self.assertEqual(2, len(entry['request']['cookies']))
+                self.assertEqual(1, len(entry['response']['cookies']))
+                self.assertEqual(-1, entry['timings']['send'])
+                self.assertEqual(-1, entry['timings']['receive'])
+                self.assertEqual(12, entry['timings']['wait'])
+
+    async def test_nb003_full_ring_streaming_export_memory(self):
+        import tracemalloc, base64
+        with tempfile.TemporaryDirectory() as td:
+            flows_dir = Path(td)
+            b64_payload = base64.b64encode(b'A' * 65536).decode('ascii')
+            ids = list(range(1, 81))
+            for i in ids:
+                (flows_dir / f'{i}.json').write_text(json.dumps({
+                    'id': i, 'time': '2026-11-28T10:00:00Z', 'client_ip': '192.168.50.100',
+                    'server_ip': '93.184.216.34', 'server_port': 443, 'method': 'GET',
+                    'scheme': 'https', 'host': 'bench.example', 'path': f'/item/{i}',
+                    'status': 200, 'state': 'decrypted', 'content_type': 'text/plain',
+                    'req_bytes': 0, 'bytes': 65536, 'resp_b64': b64_payload,
+                }))
+            tracemalloc.start()
+            try:
+                count = 0
+                for chunk in server.iter_export('jsonl', ids, flows_dir=flows_dir):
+                    self.assertIsInstance(chunk, bytes)
+                    count += 1
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            self.assertEqual(80, count)
+            self.assertLess(peak, 4 * 1024 * 1024)
 
 
 class AdministrationTests(unittest.IsolatedAsyncioTestCase):
@@ -487,6 +583,31 @@ class AdministrationTests(unittest.IsolatedAsyncioTestCase):
                 res = await dispatch('inspection', {'enabled': False}, **second)
                 self.assertEqual('off', res['inspection'])
                 self.assertEqual((), applied[-1])
+
+    def test_nb004_functional_proxy_health_check(self):
+        item = controller.Controller.__new__(controller.Controller)
+        item.check_proxy_process_health = AsyncMock(return_value=True)
+        item.check_proxy_functional_health = AsyncMock(return_value=False)
+        self.assertFalse(asyncio.run(item.check_proxy_health()))
+        self.assertTrue(item.proxy_process_healthy)
+        self.assertFalse(item.proxy_functional_healthy)
+        self.assertEqual('functional_probe_failed', item.proxy_health_detail)
+
+    def test_nb002_capture_stats_baseline_handles_proxy_restart(self):
+        item = controller.Controller.__new__(controller.Controller)
+        item._proxy_stats = {'observed': 50, 'filtered': 10, 'queue_drops': 2}
+        item._stats_baseline = {'observed': 50, 'filtered': 10, 'queue_drops': 2}
+        item.retained_total = 0
+        item.evicted_ring = 0
+        item.evicted_quota = 0
+        item.controller_errors = 0
+        with patch.object(controller, 'STAGE_DIR', Path('/nonexistent-netbridge-stage')):
+            # Simulate proxy restart where proxy counters reset below baseline
+            item._proxy_stats = {'observed': 3, 'filtered': 1, 'queue_drops': 0}
+            stats = item.get_capture_stats()
+        self.assertEqual(3, stats['observed'])
+        self.assertEqual(1, stats['filtered'])
+        self.assertEqual(0, stats['dropped_queue'])
 
 
 if __name__ == '__main__':

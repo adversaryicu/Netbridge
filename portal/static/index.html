@@ -245,6 +245,7 @@
           <p class="heartbeat-bar">
             <span>STATUS // <strong id="hb-state">OFF</strong></span>
             <span>RING // <strong id="hb-flows">0 / 80</strong></span>
+            <span>LOSS // <strong id="hb-loss">0 lost</strong></span>
             <span>LAST EVENT // <strong id="hb-last-event">None yet</strong></span>
             <span>LAST POLL // <strong id="hb-last-poll">—</strong></span>
           </p>
@@ -254,7 +255,8 @@
           <button class="quiet" id="pause-flows" type="button">Pause</button>
           <a class="button quiet" id="export-jsonl" href="/api/flows-export?format=jsonl">JSONL</a>
           <a class="button quiet" id="export-har" href="/api/flows-export?format=har">HAR</a>
-          <a class="button quiet" id="export-csv" href="/api/flows-export?format=csv">CSV</a>
+          <a class="button quiet" id="export-csv-safe" href="/api/flows-export?format=csv&amp;safe=1">CSV (Safe)</a>
+          <a class="button quiet" id="export-csv" href="/api/flows-export?format=csv">CSV (Raw)</a>
           <button class="quiet" id="clear-flows" type="button">Clear</button>
           <button class="quiet" id="inspector-logout" type="button">Sign out</button>
         </div>

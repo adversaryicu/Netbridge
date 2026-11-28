@@ -260,5 +260,123 @@ class DeepSearchTests(unittest.TestCase):
             self.assertEqual([], res_none['matches'])
 
 
+class FindingsPhase1And2AddonTests(unittest.TestCase):
+    def test_nb001_websocket_and_tcp_over_128_messages_report_partial(self):
+        addon = proxy_addon.NetBridgeAddon(background=False)
+        records = []
+        addon.emit_record = lambda meta, req_b=b'', resp_b=b'': records.append((meta, req_b, resp_b))
+
+        ws_msgs = [
+            SimpleNamespace(from_client=(i % 2 == 0), is_text=True, content=b'A' * 10, timestamp=100.0 + i)
+            for i in range(150)
+        ]
+        ws_flow = SimpleNamespace(
+            client_conn=SimpleNamespace(peername=('192.168.50.105', 51000), tls=True),
+            server_conn=SimpleNamespace(address=('93.184.216.34', 443)),
+            request=SimpleNamespace(method='GET', scheme='https', pretty_host='ws.example', host='ws.example',
+                                    path='/ws', headers=[], timestamp_start=100.0),
+            websocket=SimpleNamespace(messages=ws_msgs, close_code=1000, close_reason='Normal', timestamp_end=110.0),
+        )
+        addon.websocket_end(ws_flow)
+        ws_meta = records[0][0]
+        self.assertEqual('partial', ws_meta['payload_status'])
+        self.assertEqual(150, ws_meta['total_messages'])
+        self.assertEqual(128, ws_meta['retained_messages'])
+        self.assertEqual(22, ws_meta['omitted_messages'])
+        self.assertTrue(ws_meta['messages_truncated'])
+        self.assertEqual(750, ws_meta['req_bytes'])
+        self.assertEqual(750, ws_meta['bytes'])
+        self.assertIn('omitted', ws_meta['detail'])
+
+        tcp_msgs = [
+            SimpleNamespace(from_client=(i % 2 == 0), content=b'B' * 8, timestamp=200.0 + i)
+            for i in range(140)
+        ]
+        tcp_flow = SimpleNamespace(
+            client_conn=SimpleNamespace(peername=('192.168.50.105', 51001), tls=False, timestamp_start=200.0, timestamp_end=205.0),
+            server_conn=SimpleNamespace(address=('198.51.100.1', 9000), tls=False),
+            messages=tcp_msgs, error=None, timestamp_start=200.0,
+        )
+        addon.tcp_end(tcp_flow)
+        tcp_meta = records[1][0]
+        self.assertEqual('partial', tcp_meta['payload_status'])
+        self.assertEqual(140, tcp_meta['total_messages'])
+        self.assertEqual(128, tcp_meta['retained_messages'])
+        self.assertEqual(12, tcp_meta['omitted_messages'])
+        self.assertTrue(tcp_meta['messages_truncated'])
+        self.assertEqual(560, tcp_meta['req_bytes'])
+        self.assertEqual(560, tcp_meta['bytes'])
+
+    def test_nb010_compressed_payload_unknown_decoded_size_and_zstd_window(self):
+        bomb = gzip.compress(b'\x00' * (512 * 1024))
+        msg = SimpleNamespace(headers={'content-encoding': 'gzip'}, raw_content=bomb)
+        info = proxy_addon._read_message_payload(msg, proxy_addon.MAX_HTTP_BODY)
+        self.assertFalse(info['decoded_size_known'])
+        self.assertIsNone(info['decoded_bytes'])
+        self.assertGreater(info['decoded_bytes_min'], proxy_addon.MAX_HTTP_BODY)
+        self.assertEqual(len(bomb), info['wire_bytes'])
+        self.assertEqual('partial', info['decompression_status'])
+
+        class FakeReader:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self, n):
+                return b'Z' * n
+
+        seen_kwargs = {}
+        class FakeZstd:
+            @staticmethod
+            def ZstdDecompressor(**kwargs):
+                seen_kwargs.update(kwargs)
+                return SimpleNamespace(stream_reader=lambda bio: FakeReader())
+
+        with patch.object(proxy_addon, 'zstandard', FakeZstd):
+            z_info = proxy_addon._read_message_payload(
+                SimpleNamespace(headers={'content-encoding': 'zstd'}, raw_content=b'fakezstd'),
+                1024,
+            )
+        self.assertEqual(proxy_addon.MAX_ZSTD_WINDOW_SIZE, seen_kwargs.get('max_window_size'))
+        self.assertFalse(z_info['decoded_size_known'])
+        self.assertIsNone(z_info['decoded_bytes'])
+        self.assertEqual(1025, z_info['decoded_bytes_min'])
+
+    def test_nb002_loss_counters_and_healthz_bypass(self):
+        with tempfile.TemporaryDirectory() as td:
+            stage = Path(td)
+            addon = proxy_addon.NetBridgeAddon(stage_dir=stage, background=False)
+            # Healthz request should not increment observed or emit
+            hflow = SimpleNamespace(
+                _nb_healthz=True,
+                client_conn=SimpleNamespace(peername=('127.0.0.1', 12345)),
+                request=SimpleNamespace(path='/__netbridge_healthz'),
+                response=SimpleNamespace(status_code=200),
+            )
+            addon.response(hflow)
+            self.assertEqual(0, addon.stats_snapshot()['observed'])
+
+            # Stage drop when MAX_STAGE_FILES reached
+            for i in range(proxy_addon.MAX_STAGE_FILES):
+                (stage / f'stage-{i:032x}.json').write_text('{}')
+            addon._stage_and_send(({'host': 'example.com'}, b'', b''))
+            self.assertEqual(1, addon.stats_snapshot()['stage_drops'])
+            self.assertTrue((stage / 'proxy-stats.json').is_file())
+
+    def test_nb011_measure_memory_runs_without_baseline(self):
+        sys.path.insert(0, str(ROOT / 'tests'))
+        import measure_memory
+        with patch.object(measure_memory, '_systemd_props', return_value={
+            'ActiveState': 'inactive', 'MainPID': '0', 'NRestarts': '0',
+            'Result': 'success', 'ControlGroup': '', 'CPUUsageNSec': '0',
+        }), patch.object(measure_memory, 'read_system_meminfo', return_value={'MemTotal_MiB': 352.0}):
+            snap = measure_memory.snapshot()
+        self.assertIn('netbridge-proxy', snap['services'])
+        self.assertIn('netbridge-controller', snap['services'])
+        self.assertIn('netbridge-portal', snap['services'])
+        comp = measure_memory.compare_with_baseline(snap, {'combined_Pss_MiB': 10.0, 'services': {}})
+        self.assertIn('combined_Pss_MiB_delta', comp)
+
+
 if __name__ == '__main__':
     unittest.main()
