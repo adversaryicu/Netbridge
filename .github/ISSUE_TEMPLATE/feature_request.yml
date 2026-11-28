@@ -1,0 +1,26 @@
+name: Feature Request
+description: Suggest an improvement or new capability for NetBridge
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Use Case
+      description: What workflow or limitation does this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Behavior
+      description: How should it work from the operator's perspective?
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Cardputer Zero & Security Considerations
+      description: Any notes on 352 MiB RAM limits, privilege separation, opt-in inspection, or fail-open behavior.

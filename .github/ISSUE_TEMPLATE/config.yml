@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security & Scope Policy
+    url: https://github.com/adversaryicu/Netbridge/blob/master/README.md#security--distribution
+    about: Review NetBridge's authorized-use and capture-limits documentation before posting sensitive logs.

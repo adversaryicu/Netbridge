@@ -1,0 +1,62 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in NetBridge
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue with NetBridge!
+        **Security reminder:** Never paste Wi-Fi passphrases, administrator passwords, CA private keys (`/var/lib/netbridge/ca`), or unredacted captured tokens/cookies into a public issue.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      options:
+        - Transparent Proxy / mitmdump
+        - Inspector / Browser Capture Archive
+        - Controller / Firewall / AP
+        - Installer / Updater
+        - Cardputer Screen / APPLaunch
+        - Documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Summary (Expected vs. Actual Behavior)
+      description: Describe what you expected to happen and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Launch NetBridge from APPLaunch...
+        2. Connect client and enable inspection...
+        3. Observe...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Cardputer Zero OS version, NetBridge commit/tag, and test client OS/browser.
+      placeholder: |
+        - Device: M5Stack Cardputer Zero (Debian 13 ARM64)
+        - NetBridge commit:
+        - Client OS & Browser:
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted Diagnostics / Logs
+      description: Output of `sudo ./install.sh status` or relevant `journalctl` / `/var/lib/netbridge/audit.log` lines (redacted).
+      render: shell
