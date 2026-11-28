@@ -49,7 +49,7 @@ function clearInspectorCache() {
 }
 function showOfflineCachedInspector(message) {
   showView('inspector');
-  $('hb-flows').textContent = `${lastFlows.length} / 80`;
+  $('hb-flows').textContent = `${lastFlows.length} / 100`;
   $('hb-last-event').textContent = lastFlows.length ? formatClock(lastFlows[0].time, true) : 'None yet';
   if ($('hb-state')) {
     $('hb-state').textContent = 'OFFLINE (CACHED)';
@@ -534,7 +534,7 @@ async function refreshProtected() {
           $('ingest-host').value = state.capture_host_filter || '';
         }
       }
-      $('hb-flows').textContent = `${lastFlows.length} / 80`;
+      $('hb-flows').textContent = `${lastFlows.length} / 100`;
       if ($('hb-loss') && state.capture_stats) {
         const cs = state.capture_stats;
         const lost = cs.total_loss || 0;
@@ -553,7 +553,7 @@ async function refreshProtected() {
       showView('admin');
       $('wan-state').textContent = state.wan_connected ? 'Connected' : 'Offline';
       $('client-count').textContent = state.clients.length;
-      $('flow-count').textContent = `${(state.flows || []).length} / 80`;
+      $('flow-count').textContent = `${(state.flows || []).length} / 100`;
       if (document.activeElement !== $('ssid')) $('ssid').value = state.ssid;
       const container = $('clients'); container.replaceChildren();
       if (!state.clients.length) {
@@ -831,7 +831,7 @@ $('clear-flows').addEventListener('click', async () => {
     clearInspectorCache();
     clearDeepSearch(false);
     $('inspector-content').hidden = true; $('inspector-empty').hidden = false;
-    $('hb-flows').textContent = '0 / 80';
+    $('hb-flows').textContent = '0 / 100';
     $('hb-last-event').textContent = 'Cleared';
     renderFlows();
     notice('Cleared recorded traffic flows.');

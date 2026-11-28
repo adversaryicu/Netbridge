@@ -99,7 +99,7 @@ class ControllerTests(unittest.TestCase):
             flows_dir.mkdir()
             stage_dir.mkdir()
             with patch.object(controller, 'FLOWS_DIR', flows_dir), patch.object(controller, 'STAGE_DIR', stage_dir):
-                for i in range(90):
+                for i in range(110):
                     token = f'{i:032x}'
                     (stage_dir / f'stage-{token}.json').write_text(json.dumps({
                         'host': f'site{i}.example', 'path': '/test', 'status': 200, 'state': 'decrypted',
@@ -109,10 +109,11 @@ class ControllerTests(unittest.TestCase):
                     asyncio.run(item.dispatch({'action': 'flow-event', '_peer_uid': 998, 'stage': token}))
                 self.assertEqual(controller.MAX_FLOWS, len(item.flows))
                 self.assertEqual(11, item.flows[0]['id'])
-                self.assertEqual(90, item.flows[-1]['id'])
+                self.assertEqual(110, item.flows[-1]['id'])
                 self.assertFalse((flows_dir / '1.json').exists())
-                self.assertTrue((flows_dir / '90.json').exists())
+                self.assertTrue((flows_dir / '110.json').exists())
                 self.assertEqual([], list(stage_dir.iterdir()))
+                self.assertGreater(item._last_flow_at, 0.0)
 
     def test_inspection_sync_and_fail_open(self):
         item = self.instance()
@@ -506,7 +507,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             flows_dir = Path(td)
             b64_payload = base64.b64encode(b'A' * 65536).decode('ascii')
-            ids = list(range(1, 81))
+            ids = list(range(1, 101))
             for i in ids:
                 (flows_dir / f'{i}.json').write_text(json.dumps({
                     'id': i, 'time': '2026-11-28T10:00:00Z', 'client_ip': '192.168.50.100',
@@ -524,7 +525,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 _, peak = tracemalloc.get_traced_memory()
             finally:
                 tracemalloc.stop()
-            self.assertEqual(80, count)
+            self.assertEqual(100, count)
             self.assertLess(peak, 4 * 1024 * 1024)
 
 
@@ -549,7 +550,9 @@ class AdministrationTests(unittest.IsolatedAsyncioTestCase):
             async def dispatch(action, data=None, **kwargs):
                 return await item.dispatch({'action':action, 'data':data or {}, 'ip':'192.168.50.100','secure':True, **kwargs})
             with patch.object(controller, 'ADMIN', admin), patch.object(controller, 'PAIR', pair), \
-                 patch.object(controller, 'PUBLIC', Path(temporary)), patch.object(controller, 'SYS_NET', Path(temporary)):
+                 patch.object(controller, 'PUBLIC', Path(temporary)), patch.object(controller, 'SYS_NET', Path(temporary)), \
+                 patch.object(controller, 'FLOWS_DIR', Path(temporary) / 'flows'), \
+                 patch.object(controller, 'STAGE_DIR', Path(temporary) / 'stage'):
                 auth = await dispatch('pair', {'code':code,'password':'test administrator password'})
                 self.assertTrue(admin.exists())
                 self.assertFalse(pair.exists())

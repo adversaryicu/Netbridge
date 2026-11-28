@@ -34,7 +34,7 @@ FLOWS_DIR = Path('/run/netbridge/flows')
 STAGE_DIR = Path('/run/netbridge/proxy-stage')
 CAPTURE_FILTERS_FILE = Path('/run/netbridge/capture-filters.json')
 CAPTURE_CATEGORIES = ('html', 'json', 'assets', 'images', 'binary', 'websocket', 'tcp', 'errors')
-MAX_FLOWS = 80
+MAX_FLOWS = 100
 MAX_FLOW_STORAGE_BYTES = 6 * 1024 * 1024
 PROXY_FAIL_THRESHOLD = 3
 SYS_NET = Path('/sys/class/net')
@@ -53,6 +53,7 @@ class Controller:
     proxy_functional_healthy = False
     proxy_health_detail = 'off'
     _proxy_fail_streak = 0
+    _last_flow_at = 0.0
     _synced_inspected = ()
     flow_seq = 0
     flow_bytes = 0
@@ -96,6 +97,7 @@ class Controller:
         self.proxy_functional_healthy = False
         self.proxy_health_detail = 'off'
         self._proxy_fail_streak = 0
+        self._last_flow_at = 0.0
         self._synced_inspected = ()
         self.operation = asyncio.Lock()
         self.firewall_lock = asyncio.Lock()
@@ -245,7 +247,7 @@ class Controller:
             return False
         return process.returncode == 0 and out.decode().strip() == 'active'
 
-    async def check_proxy_functional_health(self, host='127.0.0.1', port=8080, timeout=2.0):
+    async def check_proxy_functional_health(self, host='127.0.0.1', port=8080, timeout=4.0):
         writer = None
         try:
             reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
@@ -521,6 +523,7 @@ class Controller:
                 self.evicted_ring = getattr(self, 'evicted_ring', 0) + 1
             self.flows.append(summary)
             self.retained_total = getattr(self, 'retained_total', 0) + 1
+            self._last_flow_at = time.monotonic()
             self._enforce_flow_quota()
         except Failure:
             self.controller_errors = getattr(self, 'controller_errors', 0) + 1
@@ -577,7 +580,10 @@ class Controller:
                         self._proxy_fail_streak = PROXY_FAIL_THRESHOLD
                         healthy = False
                     else:
-                        func_ok = await self.check_proxy_functional_health()
+                        if time.monotonic() - getattr(self, '_last_flow_at', 0.0) < 5.0:
+                            func_ok = True
+                        else:
+                            func_ok = await self.check_proxy_functional_health()
                         self.proxy_functional_healthy = func_ok
                         if func_ok:
                             self._proxy_fail_streak = 0

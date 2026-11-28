@@ -23,13 +23,13 @@ NetBridge turns a Cardputer Zero into a pocket-sized **inline Wi-Fi Network Tap*
 - **Capture Ingest Filters & Noise Control**: Toggle 8 traffic categories (`HTML / Text`, `JSON / API`, `Scripts & CSS`, `Images & Media`, `Fonts & Binary`, `WebSockets`, `Raw TCP`, `TLS / Errors`), filter by `Ingest host…`, or enable **Skip OS/Browser Noise** inside `mitmdump` *before* payloads are read or stored.
 - **Deep Search & Offline Tab Cache**: Search on-demand across all headers, URLs, and payloads (`/api/flows-search`), with browser-only `sessionStorage` caching so logs stay viewable if the connection drops and clear when the tab closes.
 - **Opt-in & Fail-open**: Uses a persistent device-local RSA-2048 CA (`/trust`), per-client approval expiring on disconnect (`/admin`), and automatic `nftables` fail-open pass-through if `netbridge-proxy.service` stops.
-- **Tuned for 352 MiB RAM**: Bounded `80`-flow / `6 MiB` ring, bounded `zlib`/`zstd` decompression, `64 KiB` HTTP previews, and a one-shot framebuffer screen (`[R/5]` toggles password visibility).
+- **Tuned for 352 MiB RAM**: Bounded `100`-flow / `6 MiB` ring, bounded `zlib`/`zstd` decompression, `64 KiB` HTTP previews, and a one-shot framebuffer screen (`[R/5]` toggles password visibility).
 
 ## Capture Limits, Scope & Export Policy
 
 NetBridge records unredacted traffic within fixed memory bounds suited to the Cardputer Zero (`352 MiB` RAM):
 
-- **Ring & storage**: Up to `80` retained flows and `6 MiB` total staged/ring storage (`MAX_FLOWS = 80`, `MAX_FLOW_STORAGE_BYTES = 6 MiB`), with oldest entries evicted when full.
+- **Ring & storage**: Up to `100` retained flows and `6 MiB` total staged/ring storage (`MAX_FLOWS = 100`, `MAX_FLOW_STORAGE_BYTES = 6 MiB`), with oldest entries evicted when full.
 - **HTTP payloads**: `64 KiB` (`65536` bytes) retained per request/response body (`32 KiB` inline preview in the browser); `mitmdump` streams bodies over `512 KiB` (`streamed` status).
 - **Compressed payloads**: Decompression is bounded (`256 KiB` max compressed input, `2 MiB` `zstd` decoder window). Truncated or unsupported encodings (`br`, oversized, or malformed) report `decoded_size_known: false` instead of guessing an exact decoded size.
 - **WebSocket & TCP streams**: Up to `32 KiB` (`32768` bytes) retained per direction and `128` frame/chunk metadata entries; connections exceeding `128` messages report `partial` status with `total_messages`, `retained_messages`, and `omitted_messages`.
