@@ -417,6 +417,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 detail = json.loads(resp.body)
                 self.assertIn('de ad be ef', detail['request']['hex'])
                 self.assertTrue(detail['response']['is_inline_image'])
+                self.assertTrue(detail['response']['image_data_url'].startswith('data:image/png;base64,'))
                 # Inline PNG image (allowed without confirmation)
                 ev_img = h11.Request(method=b'GET', target=b'/api/flow-raw?id=1&part=response&format=raw',
                                      headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])

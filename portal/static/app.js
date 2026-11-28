@@ -443,8 +443,8 @@ async function syncBrowserArchive() {
   if (await checkArchiveExpiry()) return;
   archiveSyncBusy = true;
   try {
-    for (let batch = 0; batch < 2; batch += 1) {
-      const res = await api(`flows-since?after_id=${encodeURIComponent(archiveHighWaterId)}&limit=10`);
+    for (let batch = 0; batch < 6; batch += 1) {
+      const res = await api(`flows-since?after_id=${encodeURIComponent(archiveHighWaterId)}&limit=25`);
       if (res.device_id) {
         if (archiveDeviceId && archiveDeviceId !== res.device_id) {
           await clearBrowserArchive(true);
@@ -469,7 +469,7 @@ async function syncBrowserArchive() {
       const items = res.items || [];
       if (!items.length) break;
 
-      let prevId = archiveHighWaterId;
+      let prevId = Math.max(archiveHighWaterId, minAvail > 0 ? minAvail - 1 : 0);
       for (const detail of items) {
         const fid = detail && detail.flow ? detail.flow.id : 0;
         if (prevId > 0 && fid > prevId + 1) {
@@ -848,19 +848,28 @@ function renderMessageTab(part) {
   }
   const actions = document.createElement('div'); actions.className = 'mode-group';
   if (view.captured) {
+    const useLocalArchive = Boolean(f._archiveKey || (archiveCount > 0 && (view.hex || view.text || view.image_data_url)));
     const dlRaw = document.createElement('a'); dlRaw.className = 'mode-btn link';
     dlRaw.href = `/api/flow-raw?id=${encodeURIComponent(f.id)}&part=${part}&format=raw&download=1`;
     dlRaw.textContent = 'Download Raw';
     dlRaw.addEventListener('click', event => {
       event.preventDefault();
-      requestExportConfirmation(dlRaw.href, 'Raw Payload');
+      requestExportConfirmation(
+        dlRaw.href,
+        'Raw Payload',
+        useLocalArchive ? { url: dlRaw.href, format: 'flow-raw', flowId: f.id, part, view } : null
+      );
     });
     const dlHex = document.createElement('a'); dlHex.className = 'mode-btn link';
     dlHex.href = `/api/flow-raw?id=${encodeURIComponent(f.id)}&part=${part}&format=hex&download=1`;
     dlHex.textContent = 'Export Hex';
     dlHex.addEventListener('click', event => {
       event.preventDefault();
-      requestExportConfirmation(dlHex.href, 'Hex Dump');
+      requestExportConfirmation(
+        dlHex.href,
+        'Hex Dump',
+        useLocalArchive ? { url: dlHex.href, format: 'flow-hex', flowId: f.id, part, view } : null
+      );
     });
     actions.append(dlRaw, dlHex);
   }
@@ -897,7 +906,7 @@ function renderMessageTab(part) {
   if (resolvedMode === 'image') {
     const box = document.createElement('div'); box.className = 'image-preview-box';
     const img = document.createElement('img');
-    img.src = `/api/flow-raw?id=${encodeURIComponent(f.id)}&part=${part}&format=raw`;
+    img.src = view.image_data_url || `/api/flow-raw?id=${encodeURIComponent(f.id)}&part=${part}&format=raw`;
     img.alt = `${f.host}${f.path}`;
     const cap = document.createElement('p'); cap.className = 'small';
     cap.textContent = `${view.content_type} · ${formatBytes(view.size)}`;
@@ -1010,6 +1019,7 @@ function renderInspector() {
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
   if ($('admin').hidden && $('inspector').hidden) return;
+  const pollDelayMs = (archiveEnabled && inspectionState === 'on') ? 1500 : 3000;
   refreshTimer = setTimeout(() => refreshProtected().catch(async error => {
     if (error.status === 401) {
       await clearBrowserArchive(true);
@@ -1029,7 +1039,7 @@ function scheduleRefresh() {
       notice(error.message, true);
       scheduleRefresh();
     }
-  }), 3000);
+  }), pollDelayMs);
 }
 async function refreshProtected() {
   if (pollBusy) return;
@@ -1338,6 +1348,43 @@ function csvEscapeClient(val) {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 async function downloadBrowserArchiveExport(meta) {
+  if (meta.format === 'flow-hex' || meta.format === 'flow-raw') {
+    const v = meta.view || {};
+    let blobPart = '';
+    let mime = 'application/octet-stream';
+    let filename = `flow-${meta.flowId}-${meta.part}`;
+    if (meta.format === 'flow-hex') {
+      blobPart = v.hex || '';
+      mime = 'text/plain; charset=utf-8';
+      filename += '.hex';
+    } else if (v.image_data_url && v.image_data_url.includes(',')) {
+      const b64 = v.image_data_url.split(',', 2)[1];
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+      blobPart = bytes;
+      mime = v.content_type || 'application/octet-stream';
+      filename += '.bin';
+    } else if (v.text) {
+      blobPart = v.text;
+      mime = 'text/plain; charset=utf-8';
+      filename += '.txt';
+    } else {
+      blobPart = v.hex || '';
+      mime = 'text/plain; charset=utf-8';
+      filename += '.hex';
+    }
+    const blob = new Blob([blobPart], { type: mime });
+    const objUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objUrl;
+    link.download = filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+    return;
+  }
   const entriesList = await archiveGetAllDetails();
   if (!entriesList.length) {
     triggerExportDownload(meta.url);

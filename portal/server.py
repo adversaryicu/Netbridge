@@ -112,6 +112,8 @@ def build_payload_view(raw, content_type='', truncated=False, total_bytes=None, 
         'hex': format_hex_dump(raw, limit=MAX_PREVIEW_BYTES) if raw else '',
         'hex_truncated': len(raw) > MAX_PREVIEW_BYTES,
     }
+    if raw and ctype in SAFE_IMAGE_TYPES:
+        view['image_data_url'] = f'data:{ctype};base64,{base64.b64encode(raw).decode("ascii")}'
     if size_meta:
         view.update(size_meta)
     return view
@@ -163,9 +165,9 @@ def build_flow_detail(flow_id, flows_dir=None):
     }
 
 
-def build_flows_since(after_id, ids, limit=10, max_bytes=1048576, flows_dir=None, device_id='', capture_session_id=''):
+def build_flows_since(after_id, ids, limit=25, max_bytes=1048576, flows_dir=None, device_id='', capture_session_id=''):
     flows_dir = flows_dir or FLOWS_DIR
-    limit = max(1, min(20, int(limit)))
+    limit = max(1, min(40, int(limit)))
     sorted_ids = sorted(ids)
     min_available_id = sorted_ids[0] if sorted_ids else 0
     max_available_id = sorted_ids[-1] if sorted_ids else 0
@@ -184,8 +186,10 @@ def build_flows_since(after_id, ids, limit=10, max_bytes=1048576, flows_dir=None
         est = (
             len(detail['request'].get('text', ''))
             + len(detail['request'].get('hex', ''))
+            + len(detail['request'].get('image_data_url', ''))
             + len(detail['response'].get('text', ''))
             + len(detail['response'].get('hex', ''))
+            + len(detail['response'].get('image_data_url', ''))
             + 2048
         )
         if items and approx_bytes + est > max_bytes:
@@ -577,7 +581,7 @@ class Portal:
             if action == 'flows-since':
                 try:
                     after_id = max(0, int(request.query.get('after_id', ['0'])[0]))
-                    limit = max(1, min(20, int(request.query.get('limit', ['10'])[0])))
+                    limit = max(1, min(40, int(request.query.get('limit', ['25'])[0])))
                 except ValueError:
                     raise Reject(400, 'Invalid cursor or limit')
                 return json_response(build_flows_since(
