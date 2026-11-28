@@ -52,11 +52,15 @@ class ControllerTests(unittest.TestCase):
 
     def test_disconnect_and_reassociation_revoke_approval(self):
         item = self.instance()
-        item.reconcile({'aa:bb:cc:dd:ee:ff': 20}, {})
+        item.reconcile({'aa:bb:cc:dd:ee:ff': 30}, {}, now=100.0)
         item.clients['aa:bb:cc:dd:ee:ff']['approved'] = True
-        item.reconcile({'aa:bb:cc:dd:ee:ff': 1}, {})
+        # 5-second poll jitter must not revoke approval
+        item.reconcile({'aa:bb:cc:dd:ee:ff': 35}, {}, now=110.0)
+        self.assertTrue(item.clients['aa:bb:cc:dd:ee:ff']['approved'])
+        # Real reassociation (connected time reset to 1s) revokes approval
+        item.reconcile({'aa:bb:cc:dd:ee:ff': 1}, {}, now=112.0)
         self.assertFalse(item.clients['aa:bb:cc:dd:ee:ff']['approved'])
-        item.reconcile({}, {})
+        item.reconcile({}, {}, now=114.0)
         self.assertFalse(item.clients)
 
     def test_csrf_and_session_expiry(self):

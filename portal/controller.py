@@ -127,7 +127,8 @@ class Controller:
 
     def audit_event(self, action):
         # Action names only. No passwords, cookies, tokens, request bodies or URLs.
-        self.audit.info(action)
+        if hasattr(self, 'audit'):
+            self.audit.info(action)
 
     async def password_work(self, action, password, record=None):
         if not isinstance(password,str) or len(password)>128:
@@ -203,18 +204,24 @@ class Controller:
                 return record
         raise Failure('Connect this browser to the NetBridge Wi-Fi network first', 403)
 
-    def reconcile(self, stations, addresses):
+    def reconcile(self, stations, addresses, now=None):
         # A missing station or reset association age invalidates trust and approval.
-        now = time.monotonic()
+        now = time.monotonic() if now is None else now
+        audit = getattr(self, 'audit_event', None)
         active = {}
         for mac, age in stations.items():
             birth = now - age
             old = self.clients.get(mac)
-            if not old or abs(old['association_start'] - birth) > 3:
+            if not old or abs(old['association_start'] - birth) > 10:
+                if old and old.get('approved') and callable(audit):
+                    audit('client_reassociated_revoked')
                 old = {'mac': mac, 'downloaded': False, 'trust_confirmed': False,
                        'approved': False, 'association_start': birth}
             old['ip'], old['name'] = addresses.get(mac, ('', 'Test device'))
             active[mac] = old
+        for mac, old in self.clients.items():
+            if mac not in active and old.get('approved') and callable(audit):
+                audit('client_disconnected_revoked')
         self.clients = active
 
     def inspection_state(self):
@@ -585,6 +592,7 @@ class Controller:
         while True:
             try:
                 output = await self.command('iw', 'dev', self.network['lan'], 'station', 'dump')
+                sample_now = time.monotonic()
                 stations = {}
                 for block in output.split('Station ')[1:]:
                     mac = block.split()[0].lower()
@@ -603,9 +611,11 @@ class Controller:
                     if neighbor.get('lladdr') in stations and '.' in neighbor.get('dst', ''):
                         mac = neighbor['lladdr']
                         addresses[mac] = (neighbor['dst'], addresses.get(mac, ('', 'Test device'))[1])
-                self.reconcile(stations, addresses)
+                self.reconcile(stations, addresses, now=sample_now)
                 self.health = 'ok'
             except Exception:
+                if any(c.get('approved') for c in self.clients.values()):
+                    self.audit_event('monitor_error_cleared_clients')
                 self.clients.clear()
                 self.health = 'unavailable'
             try:

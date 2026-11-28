@@ -869,7 +869,11 @@ function renderMessageTab(part) {
 
   if (!view.captured) {
     const empty = document.createElement('p'); empty.className = 'empty small';
-    empty.textContent = f.detail && part === 'response' ? `No payload captured (${f.detail}).` : 'Empty payload (0 bytes).';
+    if (f.payload_status === 'streamed' && view.size > 0) {
+      empty.textContent = `Streamed payload (${formatBytes(view.size)}) — exceeded the 512 KiB buffer limit and was passed through without buffering in RAM.`;
+    } else {
+      empty.textContent = f.detail && part === 'response' ? `No payload captured (${f.detail}).` : 'Empty payload (0 bytes).';
+    }
     wrap.append(empty);
     return wrap;
   }
@@ -1073,6 +1077,15 @@ async function refreshProtected() {
       $('hb-flows').textContent = archiveCount > 0
         ? `${lastFlows.length} / 100 (${archiveCount} archived)`
         : `${lastFlows.length} / 100`;
+      if ($('hb-inspected')) {
+        const ic = state.inspected_clients || 0;
+        $('hb-inspected').textContent = `${ic} client${ic === 1 ? '' : 's'}`;
+        const warn = state.inspection === 'on' && ic === 0;
+        $('hb-inspected').className = warn ? 'state-warn' : (ic > 0 ? 'state-on' : '');
+        $('hb-inspected').title = warn
+          ? 'No approved, trust-confirmed clients are currently redirected to mitmdump'
+          : `${ic} approved client${ic === 1 ? '' : 's'} redirected to mitmdump`;
+      }
       if ($('hb-loss') && state.capture_stats) {
         const cs = state.capture_stats;
         const lost = cs.total_loss || 0;
