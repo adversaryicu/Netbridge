@@ -2,6 +2,7 @@
 """Privileged local controller. Only the dedicated portal UID can use its socket."""
 import asyncio
 from collections import OrderedDict, deque
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import importlib.util
@@ -19,6 +20,7 @@ import socket
 import struct
 import time
 import tomllib
+import uuid
 
 from storage import write
 from auth_worker import password_hash, password_matches
@@ -28,6 +30,7 @@ ADMIN = BASE / 'admin.json'
 PAIR = BASE / 'pairing.json'
 PUBLIC = BASE / 'portal-public'
 CA = BASE / 'ca'
+DEVICE_ID_FILE = BASE / 'device-id'
 TLS = Path('/etc/netbridge/portal-tls')
 SOCKET = '/run/netbridge/control.sock'
 FLOWS_DIR = Path('/run/netbridge/flows')
@@ -37,6 +40,7 @@ CAPTURE_CATEGORIES = ('html', 'json', 'assets', 'images', 'binary', 'websocket',
 MAX_FLOWS = 100
 MAX_FLOW_STORAGE_BYTES = 6 * 1024 * 1024
 PROXY_FAIL_THRESHOLD = 3
+MANDATORY_PROBE_INTERVAL = 30.0
 SYS_NET = Path('/sys/class/net')
 
 
@@ -54,6 +58,11 @@ class Controller:
     proxy_health_detail = 'off'
     _proxy_fail_streak = 0
     _last_flow_at = 0.0
+    _last_capture_at = 0.0
+    _last_upstream_ok_at = 0.0
+    _last_mandatory_probe_at = 0.0
+    device_id = ''
+    capture_session_id = ''
     _synced_inspected = ()
     flow_seq = 0
     flow_bytes = 0
@@ -98,6 +107,11 @@ class Controller:
         self.proxy_health_detail = 'off'
         self._proxy_fail_streak = 0
         self._last_flow_at = 0.0
+        self._last_capture_at = 0.0
+        self._last_upstream_ok_at = 0.0
+        self._last_mandatory_probe_at = 0.0
+        self.device_id = self._load_or_create_device_id()
+        self.capture_session_id = uuid.uuid4().hex
         self._synced_inspected = ()
         self.operation = asyncio.Lock()
         self.firewall_lock = asyncio.Lock()
@@ -396,6 +410,19 @@ class Controller:
             'last_error': str(proxy.get('last_error', '') or '')[:80],
         }
 
+    @staticmethod
+    def _load_or_create_device_id():
+        try:
+            if DEVICE_ID_FILE.is_file():
+                existing = DEVICE_ID_FILE.read_text().strip()
+                if re.fullmatch(r'[0-9a-f]{32}', existing):
+                    return existing
+            new_id = uuid.uuid4().hex
+            write(DEVICE_ID_FILE, new_id + '\n', 0o644)
+            return new_id
+        except OSError:
+            return uuid.uuid4().hex
+
     def clear_flow_files(self):
         proxy = self._read_proxy_stats()
         self._stats_baseline = {
@@ -415,6 +442,8 @@ class Controller:
         if hasattr(self, 'flow_sizes'):
             self.flow_sizes.clear()
         self.flow_bytes = 0
+        self.flow_seq = 0
+        self.capture_session_id = uuid.uuid4().hex
         for directory in (FLOWS_DIR, STAGE_DIR):
             if directory.exists():
                 for item in directory.iterdir():
@@ -523,7 +552,24 @@ class Controller:
                 self.evicted_ring = getattr(self, 'evicted_ring', 0) + 1
             self.flows.append(summary)
             self.retained_total = getattr(self, 'retained_total', 0) + 1
-            self._last_flow_at = time.monotonic()
+            now_mono = time.monotonic()
+            self._last_flow_at = now_mono
+            self._last_capture_at = now_mono
+            is_fresh = True
+            raw_time = summary.get('time', '')
+            if raw_time:
+                try:
+                    ts = datetime.fromisoformat(raw_time.replace('Z', '+00:00'))
+                    if (datetime.now(timezone.utc) - ts).total_seconds() > 15.0:
+                        is_fresh = False
+                except ValueError:
+                    pass
+            if is_fresh and (
+                (state in ('decrypted', 'passthrough') and 100 <= status <= 499 and bool(summary['server_ip']))
+                or (state == 'websocket' and status in (101, 1000, 1001))
+                or (state == 'tcp' and (byte_count > 0 or req_bytes > 0))
+            ):
+                self._last_upstream_ok_at = now_mono
             self._enforce_flow_quota()
         except Failure:
             self.controller_errors = getattr(self, 'controller_errors', 0) + 1
@@ -580,10 +626,15 @@ class Controller:
                         self._proxy_fail_streak = PROXY_FAIL_THRESHOLD
                         healthy = False
                     else:
-                        if time.monotonic() - getattr(self, '_last_flow_at', 0.0) < 5.0:
+                        now_mono = time.monotonic()
+                        recent_upstream = (now_mono - getattr(self, '_last_upstream_ok_at', 0.0)) < 5.0
+                        mandatory_due = (now_mono - getattr(self, '_last_mandatory_probe_at', 0.0)) >= MANDATORY_PROBE_INTERVAL
+                        if recent_upstream and not mandatory_due:
                             func_ok = True
                         else:
                             func_ok = await self.check_proxy_functional_health()
+                            if func_ok:
+                                self._last_mandatory_probe_at = now_mono
                         self.proxy_functional_healthy = func_ok
                         if func_ok:
                             self._proxy_fail_streak = 0
@@ -733,6 +784,8 @@ class Controller:
             return {
                 'ok': True,
                 'ids': [f['id'] for f in self.flows] if hasattr(self, 'flows') else [],
+                'device_id': getattr(self, 'device_id', ''),
+                'capture_session_id': getattr(self, 'capture_session_id', ''),
                 'capture_stats': self.get_capture_stats(),
             }
         if action == 'status':
@@ -741,6 +794,8 @@ class Controller:
             wan = SYS_NET / self.network['wan'] / 'carrier'
             flows = list(reversed(self.flows)) if hasattr(self, 'flows') else []
             return {'csrf': record['csrf'], 'clients': clients, 'monitor': self.health,
+                    'device_id': getattr(self, 'device_id', ''),
+                    'capture_session_id': getattr(self, 'capture_session_id', ''),
                     'wan_connected': wan.read_text().strip() == '1', 'inspection': self.inspection_state(),
                     'proxy_health': {
                         'process': getattr(self, 'proxy_process_healthy', False),

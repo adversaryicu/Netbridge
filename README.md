@@ -21,7 +21,7 @@ NetBridge turns a Cardputer Zero into a pocket-sized **inline Wi-Fi Network Tap*
 - **Unredacted, memory-bounded visibility**: Unredacted, memory-bounded application traffic inspection, with explicit indicators for partial and streamed payloads.
 - **Server-enforced export confirmation**: Authenticated `JSONL`, `HAR`, `CSV (Safe)`, `CSV (Raw)`, raw payload, and hex exports warn in the UI and require explicit server-side confirmation (`confirm=unredacted`).
 - **Capture Ingest Filters & Noise Control**: Toggle 8 traffic categories (`HTML / Text`, `JSON / API`, `Scripts & CSS`, `Images & Media`, `Fonts & Binary`, `WebSockets`, `Raw TCP`, `TLS / Errors`), filter by `Ingest host…`, or enable **Skip OS/Browser Noise** inside `mitmdump` *before* payloads are read or stored.
-- **Deep Search & Encrypted Browser Archive**: Search on-demand across all headers, URLs, and payloads (`/api/flows-search`), with `sessionStorage` offline fallback and an opt-in **Browser Archive** (`IndexedDB`) encrypted with a RAM-only non-extractable `AES-256-GCM` key (auto-purged on load, sign-out, expiry, or clear, with a persistent warning banner while data is stored).
+- **Deep Search & Ephemeral Encrypted Browser Archive**: Search on-demand across all headers, URLs, and payloads (`/api/flows-search`), with an opt-in **Browser Capture Archive** (`IndexedDB`, `256 MiB` default configurable limit) encrypted with a RAM-only non-extractable `AES-256-GCM` key (`128-bit` tag, `96-bit` unique IV, bound via AAD to device/CA/session/archive/sequence IDs), protected by Web Locks, 30-minute operator inactivity expiration, and cross-tab session invalidation.
 - **Opt-in & Fail-open**: Uses a persistent device-local RSA-2048 CA (`/trust`), per-client approval expiring on disconnect (`/admin`), and automatic `nftables` fail-open pass-through if `netbridge-proxy.service` stops.
 - **Tuned for 352 MiB RAM**: Bounded `100`-flow / `6 MiB` ring, bounded `zlib`/`zstd` decompression, `64 KiB` HTTP previews, and a one-shot framebuffer screen (`[R/5]` toggles password visibility).
 
@@ -36,6 +36,11 @@ NetBridge records unredacted traffic within fixed memory bounds suited to the Ca
 - **Headers & URLs**: Up to `96` headers per message (`2048` chars/value) and `2048` chars per URL.
 - **Protocol coverage & fail-open**: Captures HTTP, HTTPS (for trust-confirmed, approved clients), WebSockets, raw TCP, and TLS/connection errors. UDP/QUIC (`443/udp`) is blocked for inspected clients so browsers fall back to TCP/TLS. If `netbridge-proxy.service` stops or fails consecutive local `/__netbridge_healthz` checks, `nftables` redirection is flushed automatically.
 - **Capture loss accounting**: The inspector `LOSS //` indicator and exported metadata track observed, retained, intentionally filtered, evicted, queue-dropped, stage-dropped, worker-error, and IPC-failure counts.
+- **Browser Capture Archive (ephemeral encrypted storage)**:
+  - Opt-in (`Off` by default) and limited to one active writer tab per origin via Web Locks (`navigator.locks`).
+  - Encrypts records in `IndexedDB` using a RAM-only non-extractable `AES-256-GCM` key (no plaintext fallback if WebCrypto/IndexedDB/Web Locks are unavailable).
+  - Reloading, closing the tab, logging out, session expiration/revocation, CA/device identity mismatch, or 30 minutes of operator inactivity destroys access to the RAM key and attempts database deletion.
+  - **Security boundaries & limitations**: Ephemeral encryption protects against accidental persistence of readable records, browser crashes, and post-close disk inspection without the key; it does **not** guarantee physical secure erasure on SSDs, nor does it protect against XSS in the origin, privileged browser extensions, host malware, memory acquisition while active, OS swap/hibernation, or browser crash dumps.
 - **Exports**:
   - `JSONL` is the canonical lossless-within-bounds export format.
   - `HAR` exports only HTTP/HTTPS flows (`timings` fields unavailable from `mitmdump` are `-1`) and includes `_netbridge` completeness metadata.

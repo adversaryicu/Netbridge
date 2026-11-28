@@ -30,8 +30,36 @@
   <div class="site-shell" id="page-shell">
     <div id="notice" role="status" aria-live="polite" hidden></div>
     <div id="archive-banner" class="archive-banner" role="status" aria-live="polite" hidden>
-      <span id="archive-banner-text"></span>
-      <button class="danger-button" id="archive-clear-btn" type="button">Clear Browser Archive</button>
+      <div class="archive-banner__head">
+        <div class="archive-banner__title-row">
+          <span class="archive-banner__icon" aria-hidden="true">!</span>
+          <strong class="archive-banner__title">Sensitive browser archive</strong>
+          <span id="archive-status-pill" class="archive-pill">PAUSED</span>
+        </div>
+        <span class="archive-banner__crypto">AES-256-GCM · 128-bit tag · Ephemeral RAM key</span>
+      </div>
+      <p id="archive-banner-desc" class="archive-banner__desc">This browser holds encrypted, potentially sensitive and unredacted network traffic. Export required records before leaving this session.</p>
+      <div class="archive-banner__metrics">
+        <div class="archive-metric"><span>ARCHIVED FLOWS</span><strong id="archive-count-val">0</strong></div>
+        <div class="archive-metric"><span>MISSED FLOWS</span><strong id="archive-missed-val">0</strong></div>
+        <div class="archive-metric"><span>ARCHIVE STORAGE</span><strong id="archive-bytes-val">0 B</strong></div>
+        <div class="archive-metric">
+          <label for="archive-limit-select">STORAGE LIMIT</label>
+          <select id="archive-limit-select" class="archive-limit-select" aria-label="Browser archive storage limit">
+            <option value="67108864">64 MiB</option>
+            <option value="134217728">128 MiB</option>
+            <option value="268435456" selected>256 MiB</option>
+            <option value="536870912">512 MiB</option>
+          </select>
+        </div>
+      </div>
+      <div class="archive-progress" aria-hidden="true"><div id="archive-progress-bar" class="archive-progress__bar"></div></div>
+      <p id="archive-expiry-note" class="archive-banner__note">Archive expires after 30 minutes of operator inactivity. Reloading or closing this session destroys access to archived records.</p>
+      <div class="archive-banner__actions">
+        <button class="quiet" id="archive-pause-btn" type="button">Pause archive</button>
+        <button class="quiet" id="archive-export-btn" type="button">Export archive</button>
+        <button class="danger-button" id="archive-clear-btn" type="button">Clear browser archive</button>
+      </div>
     </div>
 
     <section id="setup" hidden>
@@ -262,7 +290,7 @@
           <a class="button quiet" id="export-har" href="/api/flows-export?format=har">HAR</a>
           <a class="button quiet" id="export-csv-safe" href="/api/flows-export?format=csv&amp;safe=1">CSV (Safe)</a>
           <a class="button quiet" id="export-csv" href="/api/flows-export?format=csv">CSV (Raw)</a>
-          <button class="quiet" id="clear-flows" type="button">Clear</button>
+          <button class="quiet" id="clear-flows" type="button">Clear Device Ring</button>
           <button class="quiet" id="inspector-logout" type="button">Sign out</button>
         </div>
       </div>

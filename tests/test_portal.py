@@ -541,12 +541,19 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                     'req_bytes': 0, 'bytes': 2,
                 }))
             with patch.object(server, 'FLOWS_DIR', flows_dir), \
-                 patch.object(server, 'rpc', new=AsyncMock(return_value={'status': 200, 'data': {'ok': True, 'ids': [1, 2, 3, 4, 5]}})):
+                 patch.object(server, 'rpc', new=AsyncMock(return_value={'status': 200, 'data': {
+                     'ok': True, 'ids': [1, 2, 3, 4, 5],
+                     'device_id': 'dev-123', 'capture_session_id': 'sess-abc',
+                 }})):
                 ev1 = h11.Request(method=b'GET', target=b'/api/flows-since?after_id=1&limit=2',
                                   headers=[(b'host', b'192.168.50.1'), (b'cookie', b'__Host-netbridge=tok')])
                 r1 = await self.portal.route(server.Request(ev1, b'', '192.168.50.100', True))
                 self.assertEqual(200, r1.status)
                 d1 = json.loads(r1.body)
+                self.assertEqual('dev-123', d1['device_id'])
+                self.assertEqual('sess-abc', d1['capture_session_id'])
+                self.assertEqual(1, d1['min_available_id'])
+                self.assertEqual(5, d1['max_available_id'])
                 self.assertEqual([2, 3], [x['flow']['id'] for x in d1['items']])
                 self.assertEqual(3, d1['next_after_id'])
                 self.assertTrue(d1['has_more'])
@@ -648,6 +655,44 @@ class AdministrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, stats['observed'])
         self.assertEqual(1, stats['filtered'])
         self.assertEqual(0, stats['dropped_queue'])
+
+    def test_upstream_proof_of_life_and_session_rotation(self):
+        with tempfile.TemporaryDirectory() as td:
+            dev_file = Path(td) / 'device-id'
+            with patch.object(controller, 'DEVICE_ID_FILE', dev_file), \
+                 patch.object(controller, 'FLOWS_DIR', Path(td) / 'flows'), \
+                 patch.object(controller, 'STAGE_DIR', Path(td) / 'stage'):
+                d1 = controller.Controller._load_or_create_device_id()
+                d2 = controller.Controller._load_or_create_device_id()
+                self.assertEqual(d1, d2)
+
+                item = controller.Controller.__new__(controller.Controller)
+                item.flows = __import__('collections').deque()
+                item.flow_sizes = {}
+                item.flow_seq = 0
+                item.flow_bytes = 0
+                item.retained_total = 0
+                item.evicted_ring = 0
+                item.evicted_quota = 0
+                item.controller_errors = 0
+                item._proxy_stats = {}
+                item._stats_baseline = {}
+                item._last_upstream_ok_at = 0.0
+                item.capture_session_id = 'sess-initial'
+
+                # Error/TLS-failed/502 flows must NOT count as upstream proof-of-life
+                item.record_flow({'state': 'tls_failed', 'server_ip': '1.2.3.4', 'status': 0})
+                item.record_flow({'state': 'decrypted', 'server_ip': '1.2.3.4', 'status': 502})
+                self.assertEqual(0.0, item._last_upstream_ok_at)
+
+                # Fresh successful decrypted exchange DOES update _last_upstream_ok_at
+                item.record_flow({'state': 'decrypted', 'server_ip': '93.184.216.34', 'status': 200})
+                self.assertGreater(item._last_upstream_ok_at, 0.0)
+
+                # Clearing device ring rotates capture_session_id and resets flow_seq
+                item.clear_flow_files()
+                self.assertEqual(0, item.flow_seq)
+                self.assertNotEqual('sess-initial', item.capture_session_id)
 
 
 if __name__ == '__main__':

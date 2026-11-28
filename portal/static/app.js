@@ -10,35 +10,120 @@ const INSPECTOR_CACHE_KEY = 'netbridge.inspector.cache.v1';
 let flowDetailCache = new Map();
 
 // Ephemeral RAM-key AES-256-GCM Encrypted Browser Archive (IndexedDB)
-const ARCHIVE_DB_NAME = 'netbridge_ephemeral_archive_v1';
+const ARCHIVE_DB_PREFIX = 'netbridge_archive_';
+const ARCHIVE_LEGACY_DB = 'netbridge_ephemeral_archive_v1';
+const ARCHIVE_WRITER_LOCK = 'netbridge-archive-writer-v1';
 const ARCHIVE_STORE = 'details';
+const ARCHIVE_SCHEMA_VERSION = 1;
+const ARCHIVE_INACTIVITY_MS = 30 * 60 * 1000;
+const ARCHIVE_WARN_REMAINING_MS = 5 * 60 * 1000;
+
 let archiveEnabled = false;
+let archivePausedReason = ''; // '', 'manual', 'limit', 'quota'
+let archiveId = '';
+let archiveDbName = '';
 let archiveDb = null;
 let archiveKey = null;
 let archiveIvSalt = null;
 let archiveIvCounter = 0;
+let archiveWriterLock = null;
+let archiveDbLock = null;
+let archiveDeviceId = '';
 let archiveCaFingerprint = '';
+let archiveSessionId = '';
 let archiveHighWaterId = 0;
+let archiveSeq = 0;
 let archiveCount = 0;
+let archiveMissedCount = 0;
 let archiveBytes = 0;
+let archiveLimitBytes = 256 * 1024 * 1024;
 let archiveSyncBusy = false;
+let archiveExpiresAt = 0;
+let archiveLastActivityTouch = 0;
+let archiveOrphanPending = false;
+let archiveNeedsRevalidation = false;
+let archiveLastCaptureStats = null;
 let archivedSummaries = new Map();
+const authChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('netbridge-auth-v1') : null;
 
-function purgeOrphanedArchiveDb() {
-  try {
-    if (window.indexedDB) indexedDB.deleteDatabase(ARCHIVE_DB_NAME);
-  } catch (_) {}
+function newRandomHex(bytes = 16) {
+  const arr = crypto.getRandomValues(new Uint8Array(bytes));
+  return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
 }
-function openArchiveDb() {
+function acquireExclusiveLock(name) {
+  if (!navigator.locks || typeof navigator.locks.request !== 'function') {
+    return Promise.resolve(null);
+  }
+  return new Promise(resolve => {
+    navigator.locks.request(name, { mode: 'exclusive', ifAvailable: true }, lock => {
+      if (!lock) {
+        resolve(null);
+        return;
+      }
+      return new Promise(release => {
+        resolve({ release });
+      });
+    }).catch(() => resolve(null));
+  });
+}
+function deleteDatabaseWithLock(dbName) {
+  return new Promise(async resolve => {
+    const lock = await acquireExclusiveLock(`netbridge-archive-db-${dbName}`);
+    if (!lock) {
+      resolve('active');
+      return;
+    }
+    try {
+      const req = indexedDB.deleteDatabase(dbName);
+      req.onsuccess = () => { lock.release(); resolve('deleted'); };
+      req.onerror = () => { lock.release(); resolve('error'); };
+      req.onblocked = () => { lock.release(); resolve('blocked'); };
+    } catch (_) {
+      lock.release();
+      resolve('error');
+    }
+  });
+}
+async function cleanupOrphanedArchiveDbs() {
+  if (!window.indexedDB || !navigator.locks) return;
+  const names = new Set([ARCHIVE_LEGACY_DB]);
+  if (typeof indexedDB.databases === 'function') {
+    try {
+      const dbs = await indexedDB.databases();
+      for (const db of dbs || []) {
+        if (db && db.name && (db.name.startsWith(ARCHIVE_DB_PREFIX) || db.name === ARCHIVE_LEGACY_DB)) {
+          names.add(db.name);
+        }
+      }
+    } catch (_) {}
+  }
+  let anyBlocked = false;
+  for (const name of names) {
+    if (name === archiveDbName && archiveDb) continue;
+    const outcome = await deleteDatabaseWithLock(name);
+    if (outcome === 'blocked') anyBlocked = true;
+  }
+  archiveOrphanPending = anyBlocked;
+  updateArchiveBanner();
+}
+function openArchiveDb(dbName) {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(ARCHIVE_DB_NAME, 1);
+    const req = indexedDB.open(dbName, ARCHIVE_SCHEMA_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(ARCHIVE_STORE)) {
-        db.createObjectStore(ARCHIVE_STORE, { keyPath: 'id' });
+        db.createObjectStore(ARCHIVE_STORE, { keyPath: 'key' });
       }
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => {
+        try { db.close(); } catch (_) {}
+        if (archiveDb === db) archiveDb = null;
+      };
+      resolve(db);
+    };
+    req.onblocked = () => reject(new Error('Archive database is blocked by another operation'));
     req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
   });
 }
@@ -53,41 +138,107 @@ function nextArchiveIv() {
   }
   return iv;
 }
-async function archivePutDetail(detail) {
-  if (!archiveDb || !archiveKey || !detail || !detail.flow) return;
-  const plain = new TextEncoder().encode(JSON.stringify(detail));
-  const iv = nextArchiveIv();
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, archiveKey, plain);
-  const record = { id: detail.flow.id, iv: Array.from(iv), ct, approxBytes: plain.byteLength };
-  await new Promise((resolve, reject) => {
-    const tx = archiveDb.transaction(ARCHIVE_STORE, 'readwrite');
-    tx.objectStore(ARCHIVE_STORE).put(record);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error || new Error('IndexedDB write failed'));
-  });
-  if (!archivedSummaries.has(detail.flow.id)) {
-    archiveCount += 1;
-    archiveBytes += plain.byteLength;
-  }
-  archivedSummaries.set(detail.flow.id, detail.flow);
+function buildArchiveAad(sessionId, flowId) {
+  return new TextEncoder().encode(JSON.stringify([
+    ARCHIVE_SCHEMA_VERSION,
+    archiveDeviceId || '',
+    archiveCaFingerprint || '',
+    sessionId || '',
+    archiveId || '',
+    flowId,
+  ]));
 }
-async function archiveGetDetail(flowId) {
-  if (!archiveDb || !archiveKey || !archivedSummaries.has(flowId)) return null;
+function touchArchiveActivity(force = false) {
+  if (!archiveKey && archiveCount === 0) return;
+  const now = Date.now();
+  if (!force && now - archiveLastActivityTouch < 5000) return;
+  archiveLastActivityTouch = now;
+  archiveExpiresAt = now + ARCHIVE_INACTIVITY_MS;
+}
+async function checkArchiveExpiry() {
+  if (!archiveKey && archiveCount === 0) return false;
+  if (archiveExpiresAt > 0 && Date.now() >= archiveExpiresAt) {
+    await clearBrowserArchive(true);
+    notice('Browser archive expired after 30 minutes of operator inactivity; RAM key destroyed.', true);
+    return true;
+  }
+  return false;
+}
+async function archivePutBatch(details, sessionId) {
+  if (!archiveDb || !archiveKey || !details.length) return { written: 0, quotaHit: false, limitHit: false, lastFlowId: null };
+  if (await checkArchiveExpiry()) return { written: 0, quotaHit: false, limitHit: false, lastFlowId: null };
+
+  const prepared = [];
+  let projectedBytes = archiveBytes;
+  let limitHit = false;
+  for (const detail of details) {
+    if (!detail || !detail.flow) continue;
+    const plain = new TextEncoder().encode(JSON.stringify(detail));
+    if (projectedBytes + plain.byteLength > archiveLimitBytes) {
+      limitHit = true;
+      break;
+    }
+    archiveSeq += 1;
+    const seqKey = archiveSeq;
+    const flowId = detail.flow.id;
+    const iv = nextArchiveIv();
+    const additionalData = buildArchiveAad(sessionId, flowId);
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData, tagLength: 128 }, archiveKey, plain);
+    prepared.push({
+      summary: { ...detail.flow, _archiveKey: seqKey, _captureSessionId: sessionId },
+      record: { key: seqKey, flowId, sessionId, iv: Array.from(iv), ct, approxBytes: plain.byteLength },
+    });
+    projectedBytes += plain.byteLength;
+  }
+  if (!prepared.length) {
+    return { written: 0, quotaHit: false, limitHit, lastFlowId: null };
+  }
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = archiveDb.transaction(ARCHIVE_STORE, 'readwrite');
+      const store = tx.objectStore(ARCHIVE_STORE);
+      for (const item of prepared) store.put(item.record);
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+      tx.onerror = () => reject(tx.error || new Error('IndexedDB write failed'));
+    });
+  } catch (err) {
+    const isQuota = err && (err.name === 'QuotaExceededError' || /quota/i.test(err.message || ''));
+    if (isQuota) return { written: 0, quotaHit: true, limitHit: false, lastFlowId: null };
+    throw err;
+  }
+  for (const item of prepared) {
+    archivedSummaries.set(item.record.key, item.summary);
+    archiveCount += 1;
+    archiveBytes += item.record.approxBytes;
+  }
+  return {
+    written: prepared.length,
+    quotaHit: false,
+    limitHit,
+    lastFlowId: prepared[prepared.length - 1].record.flowId,
+  };
+}
+async function archiveGetDetail(archiveKeyId) {
+  if (await checkArchiveExpiry()) return null;
+  if (!archiveDb || !archiveKey || !archivedSummaries.has(archiveKeyId)) return null;
   const rec = await new Promise((resolve, reject) => {
     const tx = archiveDb.transaction(ARCHIVE_STORE, 'readonly');
-    const req = tx.objectStore(ARCHIVE_STORE).get(flowId);
+    const req = tx.objectStore(ARCHIVE_STORE).get(archiveKeyId);
     req.onsuccess = () => resolve(req.result || null);
     req.onerror = () => reject(req.error);
   });
   if (!rec) return null;
+  const additionalData = buildArchiveAad(rec.sessionId, rec.flowId);
   const plain = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: new Uint8Array(rec.iv) },
+    { name: 'AES-GCM', iv: new Uint8Array(rec.iv), additionalData, tagLength: 128 },
     archiveKey,
     rec.ct
   );
   return JSON.parse(new TextDecoder().decode(plain));
 }
 async function archiveGetAllDetails() {
+  if (await checkArchiveExpiry()) return [];
   if (!archiveDb || !archiveKey || archiveCount === 0) return [];
   const recs = await new Promise((resolve, reject) => {
     const tx = archiveDb.transaction(ARCHIVE_STORE, 'readonly');
@@ -95,81 +246,192 @@ async function archiveGetAllDetails() {
     req.onsuccess = () => resolve(req.result || []);
     req.onerror = () => reject(req.error);
   });
-  recs.sort((a, b) => a.id - b.id);
+  recs.sort((a, b) => a.key - b.key);
   const dec = new TextDecoder();
   const out = [];
   for (const rec of recs) {
+    const additionalData = buildArchiveAad(rec.sessionId, rec.flowId);
     const plain = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: new Uint8Array(rec.iv) },
+      { name: 'AES-GCM', iv: new Uint8Array(rec.iv), additionalData, tagLength: 128 },
       archiveKey,
       rec.ct
     );
-    out.push(JSON.parse(dec.decode(plain)));
+    out.push({ key: rec.key, detail: JSON.parse(dec.decode(plain)) });
   }
   return out;
 }
 function updateArchiveBanner() {
   const banner = $('archive-banner');
-  const text = $('archive-banner-text');
-  const btn = $('toggle-browser-archive');
-  if (btn) {
-    btn.textContent = archiveEnabled ? `Browser Archive: On (${archiveCount})` : (archiveCount > 0 ? `Browser Archive: Paused (${archiveCount})` : 'Browser Archive: Off');
-    btn.className = archiveEnabled ? 'primary' : 'quiet';
+  const toggleBtn = $('toggle-browser-archive');
+  if (toggleBtn) {
+    toggleBtn.textContent = archiveEnabled
+      ? `Browser Archive: On (${archiveCount})`
+      : (archiveCount > 0 ? `Browser Archive: Paused (${archiveCount})` : 'Browser Archive: Off');
+    toggleBtn.className = archiveEnabled ? 'primary' : 'quiet';
   }
-  if (!banner || !text) return;
-  if (!archiveEnabled && archiveCount === 0) {
-    banner.hidden = true;
-    return;
+  if (!banner) return;
+  const show = archiveEnabled || archiveCount > 0 || archiveOrphanPending;
+  banner.hidden = !show;
+  if (!show) return;
+
+  const pct = Math.min(100, Math.round((archiveBytes / Math.max(1, archiveLimitBytes)) * 100));
+  const remainingMs = archiveExpiresAt ? Math.max(0, archiveExpiresAt - Date.now()) : ARCHIVE_INACTIVITY_MS;
+  const expiringSoon = archiveCount > 0 && archiveExpiresAt > 0 && remainingMs <= ARCHIVE_WARN_REMAINING_MS;
+
+  banner.classList.toggle('is-warn', pct >= 80 && pct < 95);
+  banner.classList.toggle('is-crit', pct >= 95 || expiringSoon || archiveOrphanPending);
+
+  const pill = $('archive-status-pill');
+  if (pill) {
+    if (archiveOrphanPending && !archiveEnabled && archiveCount === 0) {
+      pill.textContent = 'CLEANUP PENDING';
+      pill.className = 'archive-pill is-crit';
+    } else if (archivePausedReason === 'limit' || archivePausedReason === 'quota') {
+      pill.textContent = 'LIMIT REACHED';
+      pill.className = 'archive-pill is-crit';
+    } else if (expiringSoon) {
+      pill.textContent = 'EXPIRING SOON';
+      pill.className = 'archive-pill is-warn';
+    } else if (archiveEnabled) {
+      pill.textContent = 'RECORDING';
+      pill.className = 'archive-pill is-on';
+    } else {
+      pill.textContent = 'PAUSED';
+      pill.className = 'archive-pill';
+    }
   }
-  banner.hidden = false;
-  if (archiveCount > 0) {
-    text.textContent = `Potentially unredacted/sensitive data (${archiveCount} flow${archiveCount === 1 ? '' : 's'}, ~${formatBytes(archiveBytes)}) is stored in this tab's RAM-key AES-256-GCM IndexedDB. Export or clear it before closing this tab.`;
-  } else {
-    text.textContent = 'Encrypted Browser Archive is active (RAM-only AES-256-GCM key). Captured flows will be stored in this tab until cleared or closed.';
+  if ($('archive-count-val')) $('archive-count-val').textContent = archiveCount.toLocaleString();
+  if ($('archive-missed-val')) {
+    $('archive-missed-val').textContent = archiveMissedCount.toLocaleString();
+    $('archive-missed-val').className = archiveMissedCount > 0 ? 'state-warn' : '';
   }
+  if ($('archive-bytes-val')) $('archive-bytes-val').textContent = formatBytes(archiveBytes);
+  const bar = $('archive-progress-bar');
+  if (bar) {
+    bar.style.width = `${pct}%`;
+    bar.className = pct >= 95 ? 'archive-progress__bar is-crit' : (pct >= 80 ? 'archive-progress__bar is-warn' : 'archive-progress__bar');
+  }
+  const desc = $('archive-banner-desc');
+  if (desc) {
+    if (archiveOrphanPending && !archiveEnabled && archiveCount === 0) {
+      desc.textContent = 'Orphaned encrypted archive data from an earlier session is awaiting browser cleanup (key already destroyed).';
+    } else if (archivePausedReason === 'limit' || archivePausedReason === 'quota') {
+      desc.textContent = 'Storage limit or browser quota reached. Recording is paused; existing archived flows are preserved. Export or clear to continue.';
+    } else if (pct >= 80) {
+      desc.textContent = `Archive storage is at ${pct}% of the configured limit. Export required records soon.`;
+    } else {
+      desc.textContent = 'This browser holds encrypted, potentially sensitive and unredacted network traffic. Export required records before leaving this session.';
+    }
+  }
+  const note = $('archive-expiry-note');
+  if (note) {
+    if (expiringSoon) {
+      const mins = Math.max(1, Math.ceil(remainingMs / 60000));
+      note.textContent = `Inactivity warning: archive key will be destroyed in ~${mins} minute${mins === 1 ? '' : 's'} unless you interact with the page.`;
+    } else {
+      note.textContent = 'Archive expires after 30 minutes of operator inactivity. Reloading or closing this session destroys access to archived records.';
+    }
+  }
+  const pauseBtn = $('archive-pause-btn');
+  if (pauseBtn) {
+    pauseBtn.textContent = archiveEnabled ? 'Pause archive' : 'Resume archive';
+    pauseBtn.disabled = !archiveKey && archiveCount === 0;
+  }
+  const exportBtn = $('archive-export-btn');
+  if (exportBtn) exportBtn.disabled = archiveCount === 0;
 }
 async function clearBrowserArchive(silent = false) {
   archiveEnabled = false;
+  archivePausedReason = '';
   archiveKey = null;
   archiveIvSalt = null;
   archiveIvCounter = 0;
+  archiveSessionId = '';
   archiveHighWaterId = 0;
+  archiveSeq = 0;
   archiveCount = 0;
+  archiveMissedCount = 0;
   archiveBytes = 0;
+  archiveExpiresAt = 0;
+  archiveNeedsRevalidation = false;
   archivedSummaries.clear();
+  const dbNameToDelete = archiveDbName;
+  archiveDbName = '';
+  archiveId = '';
   if (archiveDb) {
     try { archiveDb.close(); } catch (_) {}
     archiveDb = null;
   }
-  purgeOrphanedArchiveDb();
+  if (archiveDbLock) { archiveDbLock.release(); archiveDbLock = null; }
+  if (archiveWriterLock) { archiveWriterLock.release(); archiveWriterLock = null; }
+  let deleteOutcome = 'deleted';
+  if (dbNameToDelete && window.indexedDB) {
+    deleteOutcome = await deleteDatabaseWithLock(dbNameToDelete);
+  }
+  archiveOrphanPending = (deleteOutcome === 'blocked');
   updateArchiveBanner();
   if ($('inspector') && !$('inspector').hidden) renderFlows();
-  if (!silent) notice('Cleared encrypted browser archive and dropped RAM encryption key.');
+  if (!silent) {
+    notice(
+      deleteOutcome === 'blocked'
+        ? 'RAM encryption key destroyed, but IndexedDB deletion was blocked; orphaned ciphertext awaits cleanup.'
+        : 'Cleared encrypted browser archive and destroyed RAM encryption key.'
+    );
+  }
 }
-async function toggleBrowserArchive() {
+async function startOrResumeBrowserArchive() {
+  if (await checkArchiveExpiry()) return;
   if (archiveEnabled) {
     archiveEnabled = false;
+    archivePausedReason = 'manual';
     updateArchiveBanner();
     notice(`Browser Archive paused (${archiveCount} flow${archiveCount === 1 ? '' : 's'} retained in this tab).`);
     return;
   }
-  if (!window.crypto || !window.crypto.subtle || !window.indexedDB) {
-    notice('WebCrypto AES-GCM and IndexedDB require a modern browser over HTTPS.', true);
+  if (!window.crypto || !window.crypto.subtle || !window.indexedDB || !navigator.locks) {
+    notice('Encrypted Browser Archive requires WebCrypto, IndexedDB, and Web Locks over HTTPS. Plaintext fallback is disabled.', true);
+    return;
+  }
+  if (archivePausedReason === 'limit' && archiveBytes >= archiveLimitBytes) {
+    notice('Archive storage limit reached. Increase the limit or export/clear the archive before resuming.', true);
     return;
   }
   try {
+    if (!archiveWriterLock) {
+      archiveWriterLock = await acquireExclusiveLock(ARCHIVE_WRITER_LOCK);
+      if (!archiveWriterLock) {
+        notice('Another open tab already owns the active Browser Archive writer.', true);
+        return;
+      }
+    }
+    if (!archiveId) {
+      archiveId = newRandomHex(16);
+      archiveDbName = `${ARCHIVE_DB_PREFIX}${archiveId}`;
+      archiveDbLock = await acquireExclusiveLock(`netbridge-archive-db-${archiveDbName}`);
+      if (!archiveDbLock) {
+        archiveId = '';
+        archiveDbName = '';
+        archiveWriterLock.release();
+        archiveWriterLock = null;
+        notice('Unable to acquire exclusive archive database lock.', true);
+        return;
+      }
+    }
     if (!archiveKey) {
       archiveKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
       archiveIvSalt = crypto.getRandomValues(new Uint8Array(4));
       archiveIvCounter = 0;
     }
     if (!archiveDb) {
-      archiveDb = await openArchiveDb();
+      archiveDb = await openArchiveDb(archiveDbName);
     }
+    clearInspectorCache();
     archiveEnabled = true;
+    archivePausedReason = '';
+    touchArchiveActivity(true);
     updateArchiveBanner();
     await syncBrowserArchive();
-    notice('Encrypted Browser Archive enabled (RAM-only AES-256-GCM key).');
+    notice('Encrypted Browser Archive active (RAM-only AES-256-GCM key).');
   } catch (error) {
     archiveEnabled = false;
     updateArchiveBanner();
@@ -178,34 +440,78 @@ async function toggleBrowserArchive() {
 }
 async function syncBrowserArchive() {
   if (!archiveEnabled || archiveSyncBusy || !archiveKey || !archiveDb) return;
+  if (await checkArchiveExpiry()) return;
   archiveSyncBusy = true;
   try {
     for (let batch = 0; batch < 2; batch += 1) {
       const res = await api(`flows-since?after_id=${encodeURIComponent(archiveHighWaterId)}&limit=10`);
+      if (res.device_id) {
+        if (archiveDeviceId && archiveDeviceId !== res.device_id) {
+          await clearBrowserArchive(true);
+          notice('Device identity changed; destroyed previous browser archive.', true);
+          return;
+        }
+        archiveDeviceId = res.device_id;
+      }
+      const srvSession = res.capture_session_id || '';
+      if (srvSession && archiveSessionId && archiveSessionId !== srvSession) {
+        // Controller restarted or device ring was cleared -> reset cursor without wiping archive
+        archiveSessionId = srvSession;
+        archiveHighWaterId = 0;
+        break;
+      }
+      if (srvSession && !archiveSessionId) archiveSessionId = srvSession;
+
+      const minAvail = res.min_available_id || 0;
+      if (minAvail > 0 && archiveHighWaterId > 0 && minAvail > archiveHighWaterId + 1) {
+        archiveMissedCount += (minAvail - (archiveHighWaterId + 1));
+      }
       const items = res.items || [];
+      if (!items.length) break;
+
+      let prevId = archiveHighWaterId;
       for (const detail of items) {
-        await archivePutDetail(detail);
+        const fid = detail && detail.flow ? detail.flow.id : 0;
+        if (prevId > 0 && fid > prevId + 1) {
+          archiveMissedCount += (fid - (prevId + 1));
+        }
+        if (fid > prevId) prevId = fid;
       }
-      if (typeof res.next_after_id === 'number' && res.next_after_id > archiveHighWaterId) {
-        archiveHighWaterId = res.next_after_id;
+
+      const writeRes = await archivePutBatch(items, archiveSessionId);
+      if (writeRes.lastFlowId !== null && writeRes.lastFlowId > archiveHighWaterId) {
+        archiveHighWaterId = writeRes.lastFlowId;
       }
-      if (!res.has_more || !items.length) break;
+      if (writeRes.limitHit || writeRes.quotaHit) {
+        archiveEnabled = false;
+        archivePausedReason = writeRes.quotaHit ? 'quota' : 'limit';
+        notice('Browser archive storage limit reached; recording paused while preserving existing records.', true);
+        break;
+      }
+      if (!res.has_more) break;
     }
     updateArchiveBanner();
   } catch (_) {
-    // Non-fatal: next poll will retry
+    // Non-fatal: temporary network failure pauses delivery without destroying archive
   } finally {
     archiveSyncBusy = false;
   }
 }
 function mergedFlows() {
   if (archiveCount === 0) return lastFlows;
-  const byId = new Map(archivedSummaries);
-  for (const f of lastFlows) byId.set(f.id, f);
-  return Array.from(byId.values()).sort((a, b) => b.id - a.id);
+  const out = Array.from(archivedSummaries.values());
+  const seenKey = new Set();
+  for (const f of lastFlows) {
+    const alreadyArchived = Array.from(archivedSummaries.values()).some(
+      a => a.id === f.id && a._captureSessionId === archiveSessionId
+    );
+    if (!alreadyArchived) out.push(f);
+  }
+  return out.sort((a, b) => (b._archiveKey || (1000000000 + b.id)) - (a._archiveKey || (1000000000 + a.id)));
 }
 
 function saveInspectorCache() {
+  if (archiveEnabled || archiveCount > 0) return;
   try {
     const payload = () => JSON.stringify({
       flows: lastFlows,
@@ -257,10 +563,10 @@ function showOfflineCachedInspector(message) {
 }
 const secure = location.protocol === 'https:';
 const httpsBase = `https://${location.hostname}`;
-const path = location.pathname;
-const isInspectorPage = path === '/inspector';
-const isAdminPage = path === '/admin';
-const isSetupPage = !isInspectorPage && !isAdminPage;
+function currentPath() { return location.pathname; }
+function isInspectorPage() { return currentPath() === '/inspector'; }
+function isAdminPage() { return currentPath() === '/admin'; }
+function isSetupPage() { return !isInspectorPage() && !isAdminPage(); }
 
 function notice(text, error = false) {
   $('notice').hidden = false;
@@ -383,7 +689,7 @@ function updateClientFilterOptions() {
   select.value = seen.has(current) ? current : '';
 }
 function matchesFilter(f) {
-  if (deepSearchMatchMap && !deepSearchMatchMap.has(f.id)) return false;
+  if (deepSearchMatchMap && !deepSearchMatchMap.has(f._archiveKey || f.id)) return false;
   const clientFilter = $('filter-client').value;
   const q = $('filter-host').value.trim().toLowerCase();
   const stateFilter = $('filter-state').value;
@@ -412,10 +718,11 @@ function renderFlows() {
     container.append(p); return;
   }
   for (const f of filtered) {
+    const rowKey = f._archiveKey || f.id;
     const [badgeText, kind] = flowTypeInfo(f);
     const row = document.createElement('button');
     row.type = 'button';
-    row.className = `flow-row kind-${kind}${selectedFlowId === f.id ? ' selected' : ''}`;
+    row.className = `flow-row kind-${kind}${selectedFlowId === rowKey ? ' selected' : ''}`;
     const cTime = document.createElement('span'); cTime.className = 'flow-time';
     cTime.textContent = formatClock(f.time, false); cTime.title = f.time || '';
     const cType = document.createElement('span'); cType.className = `flow-type kind-${kind}`; cType.textContent = badgeText;
@@ -429,12 +736,12 @@ function renderFlows() {
     cSize.textContent = f.state === 'tcp' ? formatBytes((f.req_bytes || 0) + (f.bytes || 0)) : formatBytes(f.bytes);
     const cLat = document.createElement('span'); cLat.className = 'flow-cell num'; cLat.textContent = `${f.duration_ms || 0}ms`;
     row.append(cTime, cType, cPath, cMethod, cStatus, cSize, cLat);
-    row.addEventListener('click', () => selectFlow(f.id));
+    row.addEventListener('click', () => selectFlow(f.id, f._archiveKey || null));
     container.append(row);
   }
 }
-async function selectFlow(flowId) {
-  selectedFlowId = flowId;
+async function selectFlow(flowId, archiveKeyId = null) {
+  selectedFlowId = archiveKeyId || flowId;
   renderFlows();
   $('inspector-empty').hidden = true;
   $('inspector-content').hidden = false;
@@ -442,11 +749,13 @@ async function selectFlow(flowId) {
   $('inspector-subtitle').textContent = '';
   $('inspector-body').replaceChildren();
   try {
-    const archived = await archiveGetDetail(flowId);
-    if (archived) {
-      selectedDetail = archived;
-      renderInspector();
-      return;
+    if (archiveKeyId) {
+      const archived = await archiveGetDetail(archiveKeyId);
+      if (archived) {
+        selectedDetail = archived;
+        renderInspector();
+        return;
+      }
     }
     selectedDetail = await api(`flow?id=${encodeURIComponent(flowId)}`);
     flowDetailCache.set(flowId, selectedDetail);
@@ -459,7 +768,7 @@ async function selectFlow(flowId) {
       notice(`Offline — showing browser-cached details for flow #${flowId}.`, true);
       return;
     }
-    const summary = mergedFlows().find(f => f.id === flowId);
+    const summary = mergedFlows().find(f => (archiveKeyId ? f._archiveKey === archiveKeyId : f.id === flowId));
     if (summary) {
       selectedDetail = {
         flow: summary,
@@ -697,19 +1006,22 @@ function renderInspector() {
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
   if ($('admin').hidden && $('inspector').hidden) return;
-  refreshTimer = setTimeout(() => refreshProtected().catch(error => {
+  refreshTimer = setTimeout(() => refreshProtected().catch(async error => {
     if (error.status === 401) {
-      clearBrowserArchive(true);
+      await clearBrowserArchive(true);
+      if (authChannel) authChannel.postMessage({ type: 'invalidate', reason: '401' });
       showView('authentication');
       notice('Session expired. Sign in again.');
-    } else if (isInspectorPage && lastFlows.length) {
+    } else if (isInspectorPage() && mergedFlows().length) {
+      archiveNeedsRevalidation = true;
       if ($('hb-state')) {
         $('hb-state').textContent = 'OFFLINE (CACHED)';
         $('hb-state').className = 'state-warn';
       }
-      notice(`Connection lost — viewing ${lastFlows.length} browser-cached flows. Cache clears when this tab closes.`, true);
+      notice(`Connection lost — viewing ${mergedFlows().length} locally retained flows. Delivery paused until reconnect.`, true);
       scheduleRefresh();
     } else {
+      archiveNeedsRevalidation = true;
       notice(error.message, true);
       scheduleRefresh();
     }
@@ -720,12 +1032,22 @@ async function refreshProtected() {
   pollBusy = true;
   try {
     const state = await api('status');
+    archiveNeedsRevalidation = false;
+    if (state.device_id) {
+      if (archiveDeviceId && archiveDeviceId !== state.device_id && archiveCount > 0) {
+        await clearBrowserArchive(true);
+        notice('Device identity changed; destroyed previous browser archive.', true);
+      }
+      archiveDeviceId = state.device_id;
+    }
     if (state.ca && state.ca.fingerprint) {
       if (archiveCaFingerprint && archiveCaFingerprint !== state.ca.fingerprint && archiveCount > 0) {
         await clearBrowserArchive(true);
+        notice('CA fingerprint changed; destroyed previous browser archive.', true);
       }
       archiveCaFingerprint = state.ca.fingerprint;
     }
+    if (state.capture_stats) archiveLastCaptureStats = state.capture_stats;
     setInspectionState(state.inspection, state.proxy_health);
     const wanText = state.wan_connected ? 'connected' : 'offline';
     $('meta-wan').textContent = wanText;
@@ -736,7 +1058,7 @@ async function refreshProtected() {
     }
     updateArchiveBanner();
 
-    if (isInspectorPage) {
+    if (isInspectorPage()) {
       showView('inspector');
       if (!filterSaveBusy && Array.isArray(state.capture_filters)) {
         const active = new Set(state.capture_filters);
@@ -868,22 +1190,41 @@ async function signOut() {
     clearTimeout(refreshTimer);
     clearInspectorCache();
     await clearBrowserArchive(true);
+    if (authChannel) authChannel.postMessage({ type: 'invalidate', reason: 'logout' });
     showView('authentication');
     notice('Signed out.');
   } catch (error) {
     notice(error.message, true);
   }
 }
+function updateNavActiveState() {
+  $('nav-setup').classList.toggle('is-active', isSetupPage());
+  $('nav-admin').classList.toggle('is-active', isAdminPage());
+  $('nav-inspector').classList.toggle('is-active', isInspectorPage());
+}
+function navigateSpa(targetPath) {
+  if (!secure || targetPath === currentPath()) return false;
+  if (targetPath !== '/admin' && targetPath !== '/inspector') return false;
+  history.pushState({ path: targetPath }, '', targetPath);
+  updateNavActiveState();
+  refreshProtected().catch(error => {
+    if (error.status === 401) {
+      clearBrowserArchive(true);
+      showView('authentication');
+    } else {
+      notice(error.message, true);
+    }
+  });
+  return true;
+}
 async function init() {
-  purgeOrphanedArchiveDb();
+  await cleanupOrphanedArchiveDbs();
   $('nav-admin').href = `${httpsBase}/admin`;
   $('nav-inspector').href = `${httpsBase}/inspector`;
   $('footer-admin').href = `${httpsBase}/admin`;
   $('footer-inspector').href = `${httpsBase}/inspector`;
   if ($('open-inspector-btn')) $('open-inspector-btn').href = `${httpsBase}/inspector`;
-  if (isSetupPage) $('nav-setup').classList.add('is-active');
-  else if (isAdminPage) $('nav-admin').classList.add('is-active');
-  else $('nav-inspector').classList.add('is-active');
+  updateNavActiveState();
 
   let info;
   try {
@@ -895,7 +1236,7 @@ async function init() {
     $('fingerprint').textContent = info.ca.fingerprint;
     $('ca-expiry').textContent = new Date(info.ca.expires).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
   } catch (error) {
-    if (isInspectorPage && loadInspectorCache()) {
+    if (isInspectorPage() && loadInspectorCache()) {
       showOfflineCachedInspector(`Cardputer unreachable — viewing ${lastFlows.length} browser-cached flows from this tab.`);
       return;
     }
@@ -904,7 +1245,7 @@ async function init() {
     return;
   }
 
-  if (isAdminPage || isInspectorPage) {
+  if (isAdminPage() || isInspectorPage()) {
     $('auth-title').textContent = pairing ? 'Pair Administrator Account' : 'Operator Sign In';
     $('auth-submit').textContent = pairing ? 'Create administrator account' : 'Sign in';
     $('pair-field').hidden = !pairing;
@@ -916,7 +1257,7 @@ async function init() {
     try {
       await refreshProtected();
     } catch (error) {
-      if (isInspectorPage && error.status !== 401 && loadInspectorCache()) {
+      if (isInspectorPage() && error.status !== 401 && loadInspectorCache()) {
         showOfflineCachedInspector(`Cardputer unreachable — viewing ${lastFlows.length} browser-cached flows from this tab.`);
         return;
       }
@@ -926,7 +1267,7 @@ async function init() {
   } else {
     showView('setup');
     await loadTrustSection();
-    if (path === '/trust' || location.hash === '#trust-section') {
+    if (currentPath() === '/trust' || location.hash === '#trust-section') {
       $('trust-section').scrollIntoView();
     }
   }
@@ -959,12 +1300,16 @@ busy($('password-form'), async () => {
   await api('admin-password', { password: $('new-password').value });
   $('new-password').value = '';
   clearTimeout(refreshTimer);
+  await clearBrowserArchive(true);
+  if (authChannel) authChannel.postMessage({ type: 'invalidate', reason: 'password_changed' });
   showView('authentication');
   notice('Administrator password updated. Sign in again.');
 });
 busy($('rotate-form'), async () => {
   const result = await api('rotate-ca', { confirmation: $('rotate-confirm').value });
   clearTimeout(refreshTimer);
+  await clearBrowserArchive(true);
+  if (authChannel) authChannel.postMessage({ type: 'invalidate', reason: 'ca_rotated' });
   showView('setup');
   notice(result.message);
   setTimeout(() => { location.href = `http://${location.hostname}/`; }, 5000);
@@ -980,16 +1325,27 @@ function csvEscapeClient(val) {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 async function downloadBrowserArchiveExport(meta) {
-  const details = await archiveGetAllDetails();
-  if (!details.length) {
+  const entriesList = await archiveGetAllDetails();
+  if (!entriesList.length) {
     triggerExportDownload(meta.url);
     return;
   }
+  const archiveMeta = {
+    source: 'browser_archive',
+    exported_at: new Date().toISOString(),
+    device_id: archiveDeviceId,
+    capture_session_id: archiveSessionId,
+    archived_flows: archiveCount,
+    missed_flows: archiveMissedCount,
+    archive_bytes: archiveBytes,
+    capture_stats: archiveLastCaptureStats || {},
+  };
   let content = '', mime = 'application/octet-stream', filename = 'netbridge-capture.jsonl';
   if (meta.format === 'csv') {
     const header = ['id', 'time', 'client_ip', 'server_ip', 'server_port', 'method', 'scheme', 'host', 'path', 'status', 'content_type', 'req_bytes', 'resp_bytes', 'duration_ms', 'state', 'detail', 'payload_status'];
     const lines = [header.join(',')];
-    for (const d of details) {
+    for (const item of entriesList) {
+      const d = item.detail;
       const m = d.flow;
       let row = [m.id, m.time || '', m.client_ip || '', m.server_ip || '', m.server_port || 0, m.method || '', m.scheme || '', m.host || '', m.path || '', m.status || 0, m.content_type || '', m.req_bytes || 0, m.bytes || 0, m.duration_ms || 0, m.state || '', m.detail || '', m.payload_status || ''];
       if (meta.safeCsv) row = row.map(v => typeof v === 'string' ? sanitizeCsvCellClient(v) : v);
@@ -999,8 +1355,9 @@ async function downloadBrowserArchiveExport(meta) {
     mime = 'text/csv; charset=utf-8';
     filename = meta.safeCsv ? 'netbridge-capture-safe.csv' : 'netbridge-capture.csv';
   } else if (meta.format === 'jsonl') {
-    const lines = [JSON.stringify({ _netbridge_meta: true, source: 'browser_archive', exported_at: new Date().toISOString(), count: details.length })];
-    for (const d of details) {
+    const lines = [JSON.stringify({ _netbridge_meta: true, ...archiveMeta })];
+    for (const item of entriesList) {
+      const d = item.detail;
       const rec = { ...d.flow };
       if (d.request && d.request.text) rec.request_text = d.request.text;
       if (d.response && d.response.text) rec.response_text = d.response.text;
@@ -1012,7 +1369,8 @@ async function downloadBrowserArchiveExport(meta) {
   } else if (meta.format === 'har') {
     const entries = [];
     let skipped = 0;
-    for (const d of details) {
+    for (const item of entriesList) {
+      const d = item.detail;
       const m = d.flow;
       const scheme = (m.scheme || 'http').toLowerCase();
       if ((m.state !== 'decrypted' && m.state !== 'passthrough') || (scheme !== 'http' && scheme !== 'https')) {
@@ -1053,7 +1411,7 @@ async function downloadBrowserArchiveExport(meta) {
         _netbridge: { flow_id: m.id, state: m.state, payload_status: m.payload_status || '' },
       });
     }
-    content = JSON.stringify({ log: { version: '1.2', creator: { name: 'NetBridge', version: '1.0' }, entries, _netbridge: { source: 'browser_archive', included_entries: entries.length, skipped_non_http: skipped } } }, null, 2);
+    content = JSON.stringify({ log: { version: '1.2', creator: { name: 'NetBridge', version: '1.0' }, entries, _netbridge: { ...archiveMeta, included_entries: entries.length, skipped_non_http: skipped } } }, null, 2);
     mime = 'application/json; charset=utf-8';
     filename = 'netbridge-capture-archive.har';
   }
@@ -1102,8 +1460,82 @@ function requestExportConfirmation(url, label, archiveMeta = null) {
 
 $('admin-toggle-inspection').addEventListener('click', () => toggleInspection($('admin-toggle-inspection')));
 $('inspector-toggle-inspection').addEventListener('click', () => toggleInspection($('inspector-toggle-inspection')));
-if ($('toggle-browser-archive')) $('toggle-browser-archive').addEventListener('click', toggleBrowserArchive);
+if ($('toggle-browser-archive')) $('toggle-browser-archive').addEventListener('click', startOrResumeBrowserArchive);
+if ($('archive-pause-btn')) $('archive-pause-btn').addEventListener('click', startOrResumeBrowserArchive);
+if ($('archive-export-btn')) {
+  $('archive-export-btn').addEventListener('click', () => {
+    requestExportConfirmation('/api/flows-export?format=jsonl', 'JSONL', {
+      url: '/api/flows-export?format=jsonl',
+      format: 'jsonl',
+      safeCsv: false,
+    });
+  });
+}
+if ($('archive-limit-select')) {
+  $('archive-limit-select').addEventListener('change', () => {
+    const val = parseInt($('archive-limit-select').value, 10);
+    if (Number.isFinite(val) && val > 0) {
+      archiveLimitBytes = val;
+      if (archivePausedReason === 'limit' && archiveBytes < archiveLimitBytes) {
+        archivePausedReason = 'manual';
+      }
+      updateArchiveBanner();
+    }
+  });
+}
 if ($('archive-clear-btn')) $('archive-clear-btn').addEventListener('click', () => clearBrowserArchive(false));
+for (const [elId, targetPath] of [
+  ['nav-admin', '/admin'],
+  ['nav-inspector', '/inspector'],
+  ['footer-admin', '/admin'],
+  ['footer-inspector', '/inspector'],
+  ['open-inspector-btn', '/inspector'],
+]) {
+  const link = $(elId);
+  if (link) {
+    link.addEventListener('click', event => {
+      if (secure && (isAdminPage() || isInspectorPage()) && navigateSpa(targetPath)) {
+        event.preventDefault();
+      }
+    });
+  }
+}
+window.addEventListener('popstate', () => {
+  if (!secure) return;
+  updateNavActiveState();
+  if (isAdminPage() || isInspectorPage()) {
+    refreshProtected().catch(() => {});
+  } else {
+    showView('setup');
+  }
+});
+window.addEventListener('pageshow', event => {
+  if (event.persisted) {
+    clearBrowserArchive(true);
+  }
+});
+if (authChannel) {
+  authChannel.addEventListener('message', event => {
+    if (event.data && event.data.type === 'invalidate') {
+      clearTimeout(refreshTimer);
+      clearInspectorCache();
+      clearBrowserArchive(true);
+      showView('authentication');
+      notice('Session invalidated in another tab; browser archive cleared.');
+    }
+  });
+}
+for (const evtName of ['pointerdown', 'keydown', 'click']) {
+  document.addEventListener(evtName, () => touchArchiveActivity(false), { passive: true });
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) checkArchiveExpiry();
+});
+setInterval(() => {
+  checkArchiveExpiry().then(expired => {
+    if (!expired && (archiveEnabled || archiveCount > 0)) updateArchiveBanner();
+  });
+}, 15000);
 window.addEventListener('beforeunload', event => {
   if (archiveCount > 0) {
     event.preventDefault();
@@ -1165,13 +1597,16 @@ $('clear-flows').addEventListener('click', async () => {
     await api('flows-clear', {});
     lastFlows = []; selectedFlowId = null; selectedDetail = null;
     clearInspectorCache();
-    await clearBrowserArchive(true);
+    archiveHighWaterId = 0;
+    archiveSessionId = '';
     clearDeepSearch(false);
     $('inspector-content').hidden = true; $('inspector-empty').hidden = false;
     $('hb-flows').textContent = '0 / 100';
     $('hb-last-event').textContent = 'Cleared';
     renderFlows();
-    notice('Cleared recorded traffic flows.');
+    notice(archiveCount > 0
+      ? 'Cleared device capture ring (encrypted browser archive preserved).'
+      : 'Cleared device capture ring.');
   } catch (error) {
     notice(error.message, true);
   }
@@ -1261,8 +1696,9 @@ async function runDeepSearch() {
     const map = new Map();
     if (archiveCount > 0) {
       const needle = q.toLowerCase();
-      const details = await archiveGetAllDetails();
-      for (const d of details) {
+      const entriesList = await archiveGetAllDetails();
+      for (const item of entriesList) {
+        const d = item.detail;
         const m = d.flow || {};
         const where = [];
         const urlBlob = `${m.method || ''} ${m.scheme || ''} ${m.host || ''} ${m.path || ''} ${m.detail || ''} ${m.server_ip || ''}`.toLowerCase();
@@ -1271,7 +1707,7 @@ async function runDeepSearch() {
         if ((m.response_headers || []).some(([k, v]) => `${k} ${v}`.toLowerCase().includes(needle))) where.push('resp_header');
         if (d.request && d.request.text && d.request.text.toLowerCase().includes(needle)) where.push('req_body');
         if (d.response && d.response.text && d.response.text.toLowerCase().includes(needle)) where.push('resp_body');
-        if (where.length) map.set(m.id, where);
+        if (where.length) map.set(m._archiveKey || item.key, where);
       }
     }
     const result = await api(`flows-search?q=${encodeURIComponent(q)}`);

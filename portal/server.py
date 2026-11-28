@@ -163,10 +163,13 @@ def build_flow_detail(flow_id, flows_dir=None):
     }
 
 
-def build_flows_since(after_id, ids, limit=10, max_bytes=1048576, flows_dir=None):
+def build_flows_since(after_id, ids, limit=10, max_bytes=1048576, flows_dir=None, device_id='', capture_session_id=''):
     flows_dir = flows_dir or FLOWS_DIR
     limit = max(1, min(20, int(limit)))
-    pending_ids = sorted(fid for fid in ids if fid > after_id)
+    sorted_ids = sorted(ids)
+    min_available_id = sorted_ids[0] if sorted_ids else 0
+    max_available_id = sorted_ids[-1] if sorted_ids else 0
+    pending_ids = [fid for fid in sorted_ids if fid > after_id]
     items = []
     approx_bytes = 0
     last_id = after_id
@@ -191,7 +194,15 @@ def build_flows_since(after_id, ids, limit=10, max_bytes=1048576, flows_dir=None
         approx_bytes += est
         last_id = fid
     has_more = any(fid > last_id for fid in pending_ids)
-    return {'items': items, 'next_after_id': last_id, 'has_more': has_more}
+    return {
+        'device_id': device_id,
+        'capture_session_id': capture_session_id,
+        'min_available_id': min_available_id,
+        'max_available_id': max_available_id,
+        'items': items,
+        'next_after_id': last_id,
+        'has_more': has_more,
+    }
 
 
 def sanitize_csv_cell(value):
@@ -569,7 +580,13 @@ class Portal:
                     limit = max(1, min(20, int(request.query.get('limit', ['10'])[0])))
                 except ValueError:
                     raise Reject(400, 'Invalid cursor or limit')
-                return json_response(build_flows_since(after_id, auth['data'].get('ids', []), limit=limit))
+                return json_response(build_flows_since(
+                    after_id,
+                    auth['data'].get('ids', []),
+                    limit=limit,
+                    device_id=auth['data'].get('device_id', ''),
+                    capture_session_id=auth['data'].get('capture_session_id', ''),
+                ))
             if action == 'flows-search':
                 q = request.query.get('q', [''])[0]
                 return json_response(search_flows(q, auth['data'].get('ids', [])))
